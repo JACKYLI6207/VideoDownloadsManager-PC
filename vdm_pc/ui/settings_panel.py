@@ -23,6 +23,18 @@ from vdm_pc.browser.extension_loader import extensions_root, parse_extension_url
 from vdm_pc.config import cache_root, download_root, save_settings
 
 
+class _ExtUrlsInput(QPlainTextEdit):
+    """QPlainTextEdit 無 editingFinished，改在失焦時儲存。"""
+
+    def __init__(self, on_commit, parent=None) -> None:
+        super().__init__(parent)
+        self._on_commit = on_commit
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        self._on_commit()
+
+
 class SettingsPanel(QWidget):
     def __init__(self, settings: dict, engine, parent=None) -> None:
         super().__init__(parent)
@@ -71,12 +83,12 @@ class SettingsPanel(QWidget):
         self.cache_input.editingFinished.connect(self._on_cache)
         form.addRow("片段暫存目錄名", self.cache_input)
 
-        self.ext_urls_input = QPlainTextEdit(settings.get("browserExtensionUrls") or "")
+        self.ext_urls_input = _ExtUrlsInput(self._on_ext_urls)
+        self.ext_urls_input.setPlainText(settings.get("browserExtensionUrls") or "")
         self.ext_urls_input.setPlaceholderText(
             "每行一個：Chrome 線上商店網址、本機 .crx 或解壓資料夾路徑"
         )
         self.ext_urls_input.setMaximumHeight(88)
-        self.ext_urls_input.editingFinished.connect(self._on_ext_urls)
         ext_btn_row = QHBoxLayout()
         ext_install_btn = QPushButton("下載擴充")
         ext_install_btn.clicked.connect(self._install_extensions)
