@@ -1,0 +1,60 @@
+APP_STYLESHEET = """
+QWidget {
+  font-family: "Microsoft JhengHei UI", "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: #1a1a1a;
+  background: #f4f6f8;
+}
+QTabWidget::pane {
+  border: 1px solid #d8dee6;
+  background: #ffffff;
+  border-radius: 8px;
+}
+QTabBar::tab {
+  padding: 8px 16px;
+  margin-right: 4px;
+  background: #e8edf2;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+}
+QTabBar::tab:selected {
+  background: #ffffff;
+  font-weight: 600;
+}
+QPushButton {
+  padding: 6px 12px;
+  border: 1px solid #c5ced8;
+  border-radius: 6px;
+  background: #ffffff;
+}
+QPushButton:hover { background: #eef3f8; }
+QPushButton:disabled { color: #9aa5b1; }
+QPushButton#primary {
+  background: #2563eb;
+  color: white;
+  border-color: #2563eb;
+}
+QFrame#card {
+  background: #ffffff;
+  border: 1px solid #d8dee6;
+  border-radius: 8px;
+}
+QLabel#muted { color: #64748b; }
+QLineEdit, QTextEdit, QListWidget {
+  border: 1px solid #d8dee6;
+  border-radius: 6px;
+  background: #ffffff;
+}
+QProgressBar {
+  border: none;
+  background: #e8edf2;
+  border-radius: 4px;
+  height: 8px;
+  text-align: center;
+}
+QProgressBar::chunk {
+  background: #2563eb;
+  border-radius: 4px;
+}
+QProgressBar#merge::chunk { background: #16a34a; }
+"""
