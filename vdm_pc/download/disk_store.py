@@ -29,10 +29,12 @@ def write_segment(cache_root: Path, video_id: str, index: int, data: bytes) -> i
     folder = task_dir(cache_root, video_id)
     part = folder / f"{seg_name(index)}.part"
     final = folder / seg_name(index)
+    import os
+
     part.write_bytes(data)
     if final.exists():
         final.unlink()
-    part.replace(final)
+    os.replace(part, final)
     return len(data)
 
 
@@ -53,9 +55,11 @@ def write_segment_stream(
                 continue
             out.write(chunk)
             nbytes += len(chunk)
+    import os
+
     if final.exists():
         final.unlink()
-    part.replace(final)
+    os.replace(part, final)
     return nbytes
 
 
@@ -73,6 +77,21 @@ def read_merge_meta(cache_root: Path, video_id: str) -> int:
 def write_merge_meta(cache_root: Path, video_id: str, merged_through: int) -> None:
     meta = task_dir(cache_root, video_id) / MERGE_META
     meta.write_text(json.dumps({"mergedThrough": merged_through}), encoding="utf-8")
+
+
+def has_cache_data(cache_root: Path, video_id: str) -> bool:
+    folder = task_dir(cache_root, video_id)
+    if (folder / MERGE_META).is_file():
+        return True
+    if (folder / MERGED_RAW).is_file():
+        return True
+    return any(folder.glob("*.ts")) or any(folder.glob("*.part"))
+
+
+def segments_to_fetch(cache_root: Path, video_id: str, merged_through: int, total: int) -> list[int]:
+    """僅補缺段（已有 .ts 不重下）。"""
+    folder = task_dir(cache_root, video_id)
+    return [i for i in range(merged_through, total) if not (folder / seg_name(i)).is_file()]
 
 
 def count_on_disk_segments(folder: Path, merged_through: int, total: int) -> int:
@@ -110,7 +129,8 @@ class StreamMerger:
         return self.next_append + self._on_disk
 
     def note_segment_written(self) -> None:
-        self._on_disk += 1
+        with self._lock:
+            self._on_disk += 1
 
     def on_segment_written(self, on_progress=None) -> int:
         with self._lock:
@@ -118,18 +138,29 @@ class StreamMerger:
                 seg = self._folder / seg_name(self.next_append)
                 if not seg.is_file():
                     break
-                mode = "ab" if self._merged_path.exists() else "wb"
-                seg_size = seg.stat().st_size
-                with self._merged_path.open(mode) as out, seg.open("rb") as src:
-                    shutil.copyfileobj(src, out, length=MERGE_COPY_BUFSIZE)
-                    self.merged_bytes += seg_size
-                seg.unlink(missing_ok=True)
+                try:
+                    seg_size = seg.stat().st_size
+                    mode = "ab" if self._merged_path.exists() else "wb"
+                    with self._merged_path.open(mode) as out, seg.open("rb") as src:
+                        shutil.copyfileobj(src, out, length=MERGE_COPY_BUFSIZE)
+                        self.merged_bytes += seg_size
+                    seg.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    break
+                except OSError as exc:
+                    if getattr(exc, "errno", None) == 2:
+                        break
+                    raise
                 self.next_append += 1
                 self._on_disk = max(0, self._on_disk - 1)
                 write_merge_meta(self.cache_root, self.video_id, self.next_append)
                 if on_progress:
                     on_progress(self.next_append, self.total, self.merged_bytes)
             return self.next_append
+
+    def drain_ready(self, on_progress=None) -> int:
+        """合併磁碟上已就緒的連續片段（不下載）。"""
+        return self.on_segment_written(on_progress)
 
     def finish(self, on_progress=None) -> int:
         self.on_segment_written(on_progress)

@@ -56,7 +56,7 @@ def load_active() -> list[DownloadTask]:
             merged=int(snap.get("merged") or 0),
             downloaded=int(snap.get("downloaded") or 0),
             total=int(snap.get("total") or 0),
-            error="程式已重新開啟，可點「繼續」或「從頭下載」",
+            error="",
         )
         out.append(task)
     return out
