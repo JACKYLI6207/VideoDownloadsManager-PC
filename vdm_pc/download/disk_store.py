@@ -4,14 +4,15 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+from collections.abc import Callable, Iterable
 from pathlib import Path
-
-from collections.abc import Callable
 
 from vdm_pc.download.ffmpeg_util import concat_ts_to_mp4, probe_duration_sec
 
 MERGED_RAW = "merged.ts"
 MERGE_META = "merge.json"
+STREAM_CHUNK = 256 * 1024
+MERGE_COPY_BUFSIZE = 1024 * 1024
 
 
 def task_dir(cache_root: Path, video_id: str) -> Path:
@@ -24,7 +25,7 @@ def seg_name(index: int) -> str:
     return f"{index:05d}.ts"
 
 
-def write_segment(cache_root: Path, video_id: str, index: int, data: bytes) -> None:
+def write_segment(cache_root: Path, video_id: str, index: int, data: bytes) -> int:
     folder = task_dir(cache_root, video_id)
     part = folder / f"{seg_name(index)}.part"
     final = folder / seg_name(index)
@@ -32,6 +33,30 @@ def write_segment(cache_root: Path, video_id: str, index: int, data: bytes) -> N
     if final.exists():
         final.unlink()
     part.replace(final)
+    return len(data)
+
+
+def write_segment_stream(
+    cache_root: Path,
+    video_id: str,
+    index: int,
+    chunks: Iterable[bytes],
+) -> int:
+    """串流寫入片段（.part → .ts）。"""
+    folder = task_dir(cache_root, video_id)
+    part = folder / f"{seg_name(index)}.part"
+    final = folder / seg_name(index)
+    nbytes = 0
+    with part.open("wb") as out:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            out.write(chunk)
+            nbytes += len(chunk)
+    if final.exists():
+        final.unlink()
+    part.replace(final)
+    return nbytes
 
 
 def read_merge_meta(cache_root: Path, video_id: str) -> int:
@@ -50,14 +75,18 @@ def write_merge_meta(cache_root: Path, video_id: str, merged_through: int) -> No
     meta.write_text(json.dumps({"mergedThrough": merged_through}), encoding="utf-8")
 
 
-def buffered_count(cache_root: Path, video_id: str, total: int, merged_through: int = 0) -> int:
-    """已緩衝片段數（mergedThrough + 磁碟上所有未合併 .ts，允許並行下載出現空洞）。"""
-    folder = task_dir(cache_root, video_id)
-    n = merged_through
+def count_on_disk_segments(folder: Path, merged_through: int, total: int) -> int:
+    n = 0
     for i in range(merged_through, total):
         if (folder / seg_name(i)).is_file():
             n += 1
     return n
+
+
+def buffered_count(cache_root: Path, video_id: str, total: int, merged_through: int = 0) -> int:
+    """已緩衝片段數（僅任務啟動時掃描；執行中請用 StreamMerger.buffered_count）。"""
+    folder = task_dir(cache_root, video_id)
+    return merged_through + count_on_disk_segments(folder, merged_through, total)
 
 
 class StreamMerger:
@@ -72,8 +101,16 @@ class StreamMerger:
         self._lock = threading.Lock()
         self._folder = task_dir(cache_root, video_id)
         self._merged_path = self._folder / MERGED_RAW
+        self._on_disk = count_on_disk_segments(self._folder, start, total)
         if start > 0 and self._merged_path.is_file():
             self.merged_bytes = self._merged_path.stat().st_size
+
+    @property
+    def buffered_count(self) -> int:
+        return self.next_append + self._on_disk
+
+    def note_segment_written(self) -> None:
+        self._on_disk += 1
 
     def on_segment_written(self, on_progress=None) -> int:
         with self._lock:
@@ -82,12 +119,13 @@ class StreamMerger:
                 if not seg.is_file():
                     break
                 mode = "ab" if self._merged_path.exists() else "wb"
+                seg_size = seg.stat().st_size
                 with self._merged_path.open(mode) as out, seg.open("rb") as src:
-                    chunk = src.read()
-                    out.write(chunk)
-                    self.merged_bytes += len(chunk)
+                    shutil.copyfileobj(src, out, length=MERGE_COPY_BUFSIZE)
+                    self.merged_bytes += seg_size
                 seg.unlink(missing_ok=True)
                 self.next_append += 1
+                self._on_disk = max(0, self._on_disk - 1)
                 write_merge_meta(self.cache_root, self.video_id, self.next_append)
                 if on_progress:
                     on_progress(self.next_append, self.total, self.merged_bytes)
