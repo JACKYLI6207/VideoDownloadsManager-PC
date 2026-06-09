@@ -31,8 +31,8 @@ def load_settings() -> dict:
                 data.update(loaded)
         except (OSError, json.JSONDecodeError):
             pass
-    data["maxConcurrentTasks"] = max(1, min(6, int(data.get("maxConcurrentTasks") or 2)))
-    data["maxConnections"] = max(1, min(18, int(data.get("maxConnections") or 3)))
+    data["maxConcurrentTasks"] = max(1, int(data.get("maxConcurrentTasks") or 2))
+    data["maxConnections"] = max(1, int(data.get("maxConnections") or 3))
     if not data.get("downloadFolder"):
         data["downloadFolder"] = str(Path.home() / "Downloads" / "VideoDownloadsManager")
     return data

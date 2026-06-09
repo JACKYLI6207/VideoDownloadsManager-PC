@@ -54,13 +54,13 @@ class DownloadEngine(QObject):
             return False
         return self._task_gen.get(task_id, 0) == gen
     def _global_limit(self) -> int:
-        tasks = max(1, min(6, int(self.settings.get("maxConcurrentTasks") or 2)))
-        conn = max(1, min(18, int(self.settings.get("maxConnections") or 3)))
+        tasks = max(1, int(self.settings.get("maxConcurrentTasks") or 2))
+        conn = max(1, int(self.settings.get("maxConnections") or 3))
         return min(108, tasks * conn)
     def _worker_limit(self) -> int:
-        return max(1, min(18, int(self.settings.get("maxConnections") or 3)))
+        return max(1, int(self.settings.get("maxConnections") or 3))
     def _max_concurrent_tasks(self) -> int:
-        return max(1, min(6, int(self.settings.get("maxConcurrentTasks") or 2)))
+        return max(1, int(self.settings.get("maxConcurrentTasks") or 2))
     def _restore_persisted(self) -> None:
         for task in persist.load_active():
             self._reconcile_task_cache(task)

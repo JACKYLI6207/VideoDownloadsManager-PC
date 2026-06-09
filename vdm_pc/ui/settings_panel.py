@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -43,25 +42,19 @@ class SettingsPanel(QWidget):
         root = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.tasks_val = QLabel(str(settings["maxConcurrentTasks"]))
-        self.tasks_slider = QSlider(Qt.Orientation.Horizontal)
-        self.tasks_slider.setRange(1, 6)
-        self.tasks_slider.setValue(int(settings["maxConcurrentTasks"]))
-        self.tasks_slider.valueChanged.connect(self._on_tasks)
-        tasks_row = QHBoxLayout()
-        tasks_row.addWidget(self.tasks_slider, 1)
-        tasks_row.addWidget(self.tasks_val)
-        form.addRow("同時最大下載任務數", tasks_row)
+        self.tasks_input = QLineEdit(str(settings["maxConcurrentTasks"]))
+        self.tasks_input.setValidator(QIntValidator(1, 9999, self))
+        self.tasks_input.setFixedWidth(72)
+        self.tasks_input.setPlaceholderText("1 以上整數")
+        self.tasks_input.editingFinished.connect(self._on_tasks)
+        form.addRow("同時最大下載任務數", self.tasks_input)
 
-        self.conn_val = QLabel(str(settings["maxConnections"]))
-        self.conn_slider = QSlider(Qt.Orientation.Horizontal)
-        self.conn_slider.setRange(1, 18)
-        self.conn_slider.setValue(int(settings["maxConnections"]))
-        self.conn_slider.valueChanged.connect(self._on_conn)
-        conn_row = QHBoxLayout()
-        conn_row.addWidget(self.conn_slider, 1)
-        conn_row.addWidget(self.conn_val)
-        form.addRow("單任務最大連線數（HLS 片段並行）", conn_row)
+        self.conn_input = QLineEdit(str(settings["maxConnections"]))
+        self.conn_input.setValidator(QIntValidator(1, 9999, self))
+        self.conn_input.setFixedWidth(72)
+        self.conn_input.setPlaceholderText("1 以上整數")
+        self.conn_input.editingFinished.connect(self._on_conn)
+        form.addRow("單任務最大連線數（HLS 片段並行）", self.conn_input)
 
         folder_row = QHBoxLayout()
         self.folder_label = QLabel(str(download_root(settings)))
@@ -107,6 +100,7 @@ class SettingsPanel(QWidget):
             f"片段暫存：{cache_root(settings)}\n"
             f"擴充檔案：{extensions_root()}\n"
             "擴充會在啟動瀏覽器時自動載入（無需從商店手動安裝）。\n"
+            "任務數／連線數可自訂；全局片段並行硬上限仍為 108。\n"
             "HLS 合併使用內建 FFmpeg，輸出標準 MP4。"
         )
         hint.setObjectName("muted")
@@ -114,15 +108,24 @@ class SettingsPanel(QWidget):
         root.addWidget(hint)
         root.addStretch(1)
 
-    def _on_tasks(self, val: int) -> None:
+    @staticmethod
+    def _parse_positive_int(text: str, fallback: int) -> int:
+        try:
+            return max(1, int(str(text).strip()))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _on_tasks(self) -> None:
+        val = self._parse_positive_int(self.tasks_input.text(), int(self.settings.get("maxConcurrentTasks") or 2))
+        self.tasks_input.setText(str(val))
         self.settings["maxConcurrentTasks"] = val
-        self.tasks_val.setText(str(val))
         self.engine.update_settings(self.settings)
         save_settings(self.settings)
 
-    def _on_conn(self, val: int) -> None:
+    def _on_conn(self) -> None:
+        val = self._parse_positive_int(self.conn_input.text(), int(self.settings.get("maxConnections") or 3))
+        self.conn_input.setText(str(val))
         self.settings["maxConnections"] = val
-        self.conn_val.setText(str(val))
         self.engine.update_settings(self.settings)
         save_settings(self.settings)
 
