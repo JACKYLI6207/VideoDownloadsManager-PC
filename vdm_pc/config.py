@@ -12,6 +12,7 @@ DEFAULTS = {
     "downloadSubfolder": "",
     "segmentCacheDir": "vdm-cache",
     "browserProfileDir": "",
+    "browserExtensionUrls": "",
 }
 
 _CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "VideoDownloadsManager-PC" / "settings.json"

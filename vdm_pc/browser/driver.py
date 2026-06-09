@@ -9,6 +9,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 from playwright.sync_api import sync_playwright
 
+from vdm_pc.browser.extension_loader import parse_extension_urls, sync_extensions
 from vdm_pc.browser.sniffer import MediaSniffer
 
 
@@ -18,10 +19,18 @@ class PlaywrightDriver(QThread):
     resource_detected = pyqtSignal(str, dict, str, str)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, profile_dir: Path, sniffer: MediaSniffer, headless: bool = False) -> None:
+    def __init__(
+        self,
+        profile_dir: Path,
+        sniffer: MediaSniffer,
+        *,
+        extension_urls: list[str] | None = None,
+        headless: bool = False,
+    ) -> None:
         super().__init__()
         self.profile_dir = profile_dir
         self.sniffer = sniffer
+        self.extension_urls = extension_urls or []
         self.headless = headless
         self.active = True
         self._target_url: str | None = None
@@ -39,12 +48,21 @@ class PlaywrightDriver(QThread):
                 driver_root = Path(sys._MEIPASS) / "playwright" / "driver"
                 if driver_root.is_dir():
                     os.environ.setdefault("PLAYWRIGHT_DRIVER_PATH", str(driver_root))
+            ext_paths = sync_extensions(self.extension_urls)
+            if self.extension_urls and not ext_paths:
+                self.error_occurred.emit("擴充下載失敗，請在「設定」檢查網址後按「下載擴充」")
+            chrome_args = ["--disable-blink-features=AutomationControlled"]
+            if ext_paths:
+                joined = ",".join(str(p) for p in ext_paths)
+                chrome_args.append(f"--disable-extensions-except={joined}")
+                chrome_args.append(f"--load-extension={joined}")
+
             with sync_playwright() as p:
                 context = p.chromium.launch_persistent_context(
                     user_data_dir=str(self.profile_dir),
                     channel="chrome",
                     headless=self.headless,
-                    args=["--disable-blink-features=AutomationControlled"],
+                    args=chrome_args,
                     ignore_default_args=["--enable-automation"],
                 )
                 page = context.pages[0] if context.pages else context.new_page()

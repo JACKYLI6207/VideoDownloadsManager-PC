@@ -11,11 +11,14 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QSlider,
     QVBoxLayout,
     QWidget,
 )
+
+from vdm_pc.browser.extension_loader import extensions_root, parse_extension_urls, sync_extensions
 
 from vdm_pc.config import cache_root, download_root, save_settings
 
@@ -68,10 +71,30 @@ class SettingsPanel(QWidget):
         self.cache_input.editingFinished.connect(self._on_cache)
         form.addRow("片段暫存目錄名", self.cache_input)
 
+        self.ext_urls_input = QPlainTextEdit(settings.get("browserExtensionUrls") or "")
+        self.ext_urls_input.setPlaceholderText(
+            "每行一個：Chrome 線上商店網址、本機 .crx 或解壓資料夾路徑"
+        )
+        self.ext_urls_input.setMaximumHeight(88)
+        self.ext_urls_input.editingFinished.connect(self._on_ext_urls)
+        ext_btn_row = QHBoxLayout()
+        ext_install_btn = QPushButton("下載擴充")
+        ext_install_btn.clicked.connect(self._install_extensions)
+        ext_open_btn = QPushButton("開啟擴充資料夾")
+        ext_open_btn.clicked.connect(self._open_extensions_dir)
+        ext_btn_row.addWidget(ext_install_btn)
+        ext_btn_row.addWidget(ext_open_btn)
+        ext_btn_row.addStretch(1)
+        ext_wrap = QVBoxLayout()
+        ext_wrap.addWidget(self.ext_urls_input)
+        ext_wrap.addLayout(ext_btn_row)
+        form.addRow("瀏覽器擴充網址", ext_wrap)
+
         root.addLayout(form)
         hint = QLabel(
             f"片段暫存：{cache_root(settings)}\n"
-            "瀏覽器 Cookie 保存在 Playwright 持久化 Chrome 設定檔。\n"
+            f"擴充檔案：{extensions_root()}\n"
+            "擴充會在啟動瀏覽器時自動載入（無需從商店手動安裝）。\n"
             "HLS 合併使用內建 FFmpeg，輸出標準 MP4。"
         )
         hint.setObjectName("muted")
@@ -98,6 +121,25 @@ class SettingsPanel(QWidget):
     def _on_cache(self) -> None:
         self.settings["segmentCacheDir"] = self.cache_input.text().strip() or "vdm-cache"
         save_settings(self.settings)
+
+    def _on_ext_urls(self) -> None:
+        self.settings["browserExtensionUrls"] = self.ext_urls_input.toPlainText().strip()
+        save_settings(self.settings)
+
+    def _install_extensions(self) -> None:
+        self._on_ext_urls()
+        urls = parse_extension_urls(self.settings.get("browserExtensionUrls") or "")
+        if not urls:
+            return
+        paths = sync_extensions(urls)
+        self.ext_urls_input.setToolTip(f"已就緒 {len(paths)} 個擴充，請重新啟動瀏覽器")
+
+    def _open_extensions_dir(self) -> None:
+        path = str(extensions_root())
+        if os.name == "nt":
+            os.startfile(path)  # noqa: S606
+        else:
+            subprocess.Popen(["xdg-open", path])  # noqa: S603,S607
 
     def _pick_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "選擇下載資料夾", self.settings.get("downloadFolder", ""))

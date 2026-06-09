@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 
 from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.sniffer import MediaSniffer, SniffedResource
+from vdm_pc.browser.extension_loader import parse_extension_urls
 from vdm_pc.config import browser_profile_dir
 
 
@@ -95,7 +96,8 @@ class BrowserPanel(QWidget):
         if self.driver and self.driver.isRunning():
             return
         profile = browser_profile_dir(self.settings)
-        self.driver = PlaywrightDriver(profile, self.sniffer)
+        ext_urls = parse_extension_urls(self.settings.get("browserExtensionUrls") or "")
+        self.driver = PlaywrightDriver(profile, self.sniffer, extension_urls=ext_urls)
         self.driver.browser_ready.connect(self._on_ready)
         self.driver.page_closed.connect(self._on_closed)
         self.driver.resource_detected.connect(self._on_detected)
@@ -104,7 +106,10 @@ class BrowserPanel(QWidget):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText("正在啟動…")
-        self._log("正在啟動 Chrome（Playwright 持久化設定檔）…")
+        if ext_urls:
+            self._log(f"正在啟動 Chrome（含 {len(ext_urls)} 個擴充）…")
+        else:
+            self._log("正在啟動 Chrome（Playwright 持久化設定檔）…")
 
     def _stop_browser(self) -> None:
         if self.driver and self.driver.isRunning():
