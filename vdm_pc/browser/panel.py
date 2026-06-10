@@ -8,12 +8,13 @@ from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -24,7 +25,17 @@ from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.extension_loader import parse_extension_urls
 from vdm_pc.config import browser_profile_dir
 from vdm_pc.import_tasks import export_payload, import_tasks, normalize_url, parse_import_file
-from vdm_pc.models import DownloadTask, VideoMeta
+from vdm_pc.models import DownloadTask, VideoMeta, format_resolution, resolve_quality
+
+
+def _resolution_label(task: DownloadTask) -> str:
+    q = resolve_quality(
+        task.video.url,
+        task.file_name,
+        task.video.title,
+        quality=task.video.quality,
+    )
+    return format_resolution(q)
 
 
 def _task_from_snap(snap: dict) -> DownloadTask | None:
@@ -87,9 +98,19 @@ class BrowserPanel(QWidget):
         left.setObjectName("card")
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(QLabel("可下載清單"))
-        self.resource_list = QListWidget()
-        self.resource_list.itemDoubleClicked.connect(self._download_one)
-        left_layout.addWidget(self.resource_list, 1)
+        self.resource_table = QTableWidget(0, 2)
+        self.resource_table.setHorizontalHeaderLabels(["影片名稱", "解析度"])
+        self.resource_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.resource_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.resource_table.setColumnWidth(1, 72)
+        self.resource_table.verticalHeader().setVisible(False)
+        self.resource_table.setShowGrid(False)
+        self.resource_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.resource_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.resource_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.resource_table.setAlternatingRowColors(True)
+        self.resource_table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        left_layout.addWidget(self.resource_table, 1)
         btn_row = QHBoxLayout()
         for label, slot in (
             ("全部下載", self._download_all),
@@ -193,12 +214,14 @@ class BrowserPanel(QWidget):
             self._log(f"擴充已加入 {added} 個任務至可下載清單")
 
     def _append_list_item(self, task: DownloadTask) -> None:
-        title = task.file_name.replace(".mp4", "")
-        url_hint = task.video.url[:100]
-        text = f"{title}\n{url_hint}"
-        item = QListWidgetItem(text)
-        item.setData(Qt.ItemDataRole.UserRole, task)
-        self.resource_list.insertItem(0, item)
+        row = 0
+        self.resource_table.insertRow(row)
+        name_item = QTableWidgetItem(task.file_name)
+        name_item.setData(Qt.ItemDataRole.UserRole, task)
+        res_item = QTableWidgetItem(_resolution_label(task))
+        res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.resource_table.setItem(row, 0, name_item)
+        self.resource_table.setItem(row, 1, res_item)
         self._rebuild_pending()
 
     def _rebuild_pending(self) -> None:
@@ -206,33 +229,40 @@ class BrowserPanel(QWidget):
 
     def _list_tasks(self) -> list[DownloadTask]:
         tasks: list[DownloadTask] = []
-        for i in range(self.resource_list.count()):
-            item = self.resource_list.item(i)
-            if not item:
-                continue
-            task = self._resolve_list_task(item)
+        for row in range(self.resource_table.rowCount()):
+            task = self._resolve_row_task(row)
             if task:
                 tasks.append(task)
         return tasks
 
-    def _selected_item(self) -> QListWidgetItem | None:
-        selected = self.resource_list.selectedItems()
-        if selected:
-            return selected[0]
-        return self.resource_list.currentItem()
+    def _selected_row(self) -> int:
+        rows = self.resource_table.selectionModel().selectedRows()
+        if rows:
+            return rows[0].row()
+        current = self.resource_table.currentRow()
+        return current if current >= 0 else -1
 
-    def _find_task(self, task_id: str) -> DownloadTask | None:
-        for task in self.pending:
-            if task.id == task_id:
-                return task
-        return None
-
-    def _resolve_list_task(self, item: QListWidgetItem) -> DownloadTask | None:
+    def _resolve_row_task(self, row: int) -> DownloadTask | None:
+        if row < 0:
+            return None
+        item = self.resource_table.item(row, 0)
+        if not item:
+            return None
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, DownloadTask):
             return data
         if isinstance(data, str):
             return self._find_task(data)
+        return None
+
+    def _on_row_double_clicked(self, row: int, _col: int) -> None:
+        self.resource_table.selectRow(row)
+        self._download_one()
+
+    def _find_task(self, task_id: str) -> DownloadTask | None:
+        for task in self.pending:
+            if task.id == task_id:
+                return task
         return None
 
     def _download_all(self) -> None:
@@ -243,11 +273,11 @@ class BrowserPanel(QWidget):
         self._enqueue_tasks(tasks)
 
     def _download_one(self) -> None:
-        item = self._selected_item()
-        if not item:
+        row = self._selected_row()
+        if row < 0:
             QMessageBox.information(self, "下載", "請先點選清單中的一筆影片。")
             return
-        task = self._resolve_list_task(item)
+        task = self._resolve_row_task(row)
         if not task:
             QMessageBox.warning(self, "下載", "無法讀取此項目，請重新從擴充加入。")
             return
@@ -261,13 +291,10 @@ class BrowserPanel(QWidget):
             self.add_download.emit(task)
             added_ids.add(task.id)
 
-        for i in range(self.resource_list.count() - 1, -1, -1):
-            row_item = self.resource_list.item(i)
-            if not row_item:
-                continue
-            task = self._resolve_list_task(row_item)
+        for row in range(self.resource_table.rowCount() - 1, -1, -1):
+            task = self._resolve_row_task(row)
             if task and task.id in added_ids:
-                self.resource_list.takeItem(i)
+                self.resource_table.removeRow(row)
 
         self._rebuild_pending()
         self._log(f"已加入下載 {len(added_ids)} 個任務（請看「進行中」）")
@@ -277,19 +304,19 @@ class BrowserPanel(QWidget):
             QMessageBox.information(self, "全部清除", "可下載清單為空。")
             return
         self.pending.clear()
-        self.resource_list.clear()
+        self.resource_table.setRowCount(0)
         self._log("已清除可下載清單全部項目")
 
     def _clear_one(self) -> None:
-        item = self._selected_item()
-        if not item:
+        row = self._selected_row()
+        if row < 0:
             QMessageBox.information(self, "清除", "請先點選清單中的一筆影片。")
             return
-        task = self._resolve_list_task(item)
+        task = self._resolve_row_task(row)
         if not task:
             QMessageBox.warning(self, "清除", "無法讀取此項目。")
             return
-        self.resource_list.takeItem(self.resource_list.row(item))
+        self.resource_table.removeRow(row)
         self._rebuild_pending()
         self._log(f"已清除：{task.file_name.replace('.mp4', '')}")
 

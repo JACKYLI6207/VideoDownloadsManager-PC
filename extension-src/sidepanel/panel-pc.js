@@ -403,7 +403,7 @@ $("#groupDownloadBtn")?.addEventListener("click", async (e) => {
   e.preventDefault();
   const btn = $("#groupDownloadBtn");
   try {
-    await withButton(btn, "傳送中…", async () => {
+    await withButton(btn, "嗅探各分頁…", async () => {
       const res = await api("START_GROUP_DOWNLOADS");
       if (!res.tasks?.length) throw new Error(res.error || "無法開始群組添加");
       showToast(`群組已添加 ${res.tasks.length} 個至 PC 可下載清單`, "info");

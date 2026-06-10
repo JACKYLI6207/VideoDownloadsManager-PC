@@ -40,10 +40,28 @@ QFrame#card {
   border-radius: 8px;
 }
 QLabel#muted { color: #64748b; }
-QLineEdit, QTextEdit, QListWidget {
+QLineEdit, QTextEdit, QListWidget, QTableWidget {
   border: 1px solid #d8dee6;
   border-radius: 6px;
   background: #ffffff;
+}
+QTableWidget {
+  gridline-color: #e8edf2;
+  selection-background-color: #dbeafe;
+  selection-color: #1a1a1a;
+  outline: none;
+}
+QTableWidget::item {
+  padding: 6px 10px;
+  border-bottom: 1px solid #e8edf2;
+}
+QHeaderView::section {
+  background: #f1f5f9;
+  color: #475569;
+  padding: 8px 10px;
+  border: none;
+  border-bottom: 1px solid #d8dee6;
+  font-weight: 600;
 }
 QProgressBar {
   border: none;

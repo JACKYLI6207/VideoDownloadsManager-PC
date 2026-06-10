@@ -161,6 +161,50 @@
     return parts.join("/") || "VideoDownloadsManager";
   };
 
+  VDM.guessMasterM3u8Candidates = (url) => {
+    const out = [];
+    const add = (u) => {
+      if (!u || u === url) return;
+      if (!out.includes(u)) out.push(u);
+    };
+    try {
+      const u = new URL(url);
+      if (!/\.m3u8/i.test(u.pathname)) return out;
+      const parts = u.pathname.split("/").filter(Boolean);
+      const names = ["index.m3u8", "master.m3u8", "playlist.m3u8", "manifest.m3u8"];
+      for (let drop = 1; drop <= 2 && parts.length > drop; drop++) {
+        const base = parts.slice(0, -drop);
+        for (const name of names) {
+          add(`${u.origin}/${[...base, name].join("/")}`);
+        }
+      }
+      const stripped = u.pathname
+        .replace(/\/(?:\d{3,4}[pP]?|low|mid|high|source)\/[^/]*$/i, "")
+        .replace(/\/(?:480|720|1080|360|240|2160)[pP]?(?:\/[^/]*)?$/i, "");
+      if (stripped && stripped !== u.pathname) {
+        const dir = stripped.endsWith("/") ? stripped : `${stripped}/`;
+        for (const name of names) {
+          add(`${u.origin}${dir}${name}`);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return out;
+  };
+
+  VDM.prioritizeSniffUrls = (urls) => {
+    const masters = [];
+    const m3u8 = [];
+    const other = [];
+    for (const u of urls) {
+      if (/master|index\.m3u8|manifest\.m3u8/i.test(u)) masters.push(u);
+      else if (/\.m3u8/i.test(u)) m3u8.push(u);
+      else other.push(u);
+    }
+    return [...new Set([...masters, ...m3u8, ...other])].slice(0, 10);
+  };
+
   VDM.scoreVideo = (url, quality, size = 0, isM3u8 = false) => {
     let score = quality * 10;
     if (size > 0) score += Math.min(Math.floor(size / 1_048_576), 500);

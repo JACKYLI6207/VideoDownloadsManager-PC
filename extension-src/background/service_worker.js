@@ -804,6 +804,160 @@ async function enqueueDownloadTasks(items) {
   return started;
 }
 
+const GROUP_SNIFF_FOCUS_MS = 400;
+const GROUP_SNIFF_TAB_GAP_MS = 120;
+
+async function probePageStreamUrls(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return [];
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      world: "MAIN",
+      func: () => {
+        const urls = new Set();
+        const add = (u) => {
+          if (!u || typeof u !== "string") return;
+          const s = u.trim();
+          if (!/\.m3u8|\.mp4|\.m4v|videoplayback/i.test(s)) return;
+          if (/^(data:|blob:)/i.test(s)) return;
+          try {
+            urls.add(new URL(s, location.href).href);
+          } catch {
+            /* ignore */
+          }
+        };
+        const scanVideo = (v) => {
+          add(v.src);
+          add(v.currentSrc);
+          for (const s of v.querySelectorAll("source")) add(s.src);
+          const hls = v.hls || v.__hls;
+          if (hls) {
+            add(hls.url);
+            add(hls._url);
+            if (hls.levels) {
+              for (const lv of hls.levels) add(lv?.url);
+            }
+          }
+        };
+        for (const v of document.querySelectorAll("video")) scanVideo(v);
+        if (window.Hls?.instances) {
+          for (const h of window.Hls.instances) {
+            add(h?.url);
+            if (h?.levels) {
+              for (const lv of h.levels) add(lv?.url);
+            }
+          }
+        }
+        if (window.videojs) {
+          for (const el of document.querySelectorAll("video, .video-js")) {
+            try {
+              const p = window.videojs.getPlayer(el);
+              if (!p) continue;
+              const src =
+                typeof p.currentSrc === "function" ? p.currentSrc() : p.currentSrc || p.src;
+              add(src);
+              const tech = p.tech?.({ IWillNotUseThisInPlugins: true });
+              if (tech?.hls?.playlists?.master?.uri) add(tech.hls.playlists.master.uri);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        if (window.jwplayer) {
+          for (const el of document.querySelectorAll("[id], video")) {
+            try {
+              const p = window.jwplayer(el);
+              if (!p?.getPlaylistItem) continue;
+              const item = p.getPlaylistItem();
+              add(item?.file);
+              for (const s of item?.sources || []) add(s?.file || s?.src);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        for (const v of document.querySelectorAll("video")) {
+          try {
+            v.muted = true;
+            const pr = v.play();
+            if (pr?.catch) pr.catch(() => {});
+          } catch {
+            /* ignore */
+          }
+        }
+        return [...urls];
+      },
+    });
+    return Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+async function withBriefTabFocus(tabId, fn) {
+  let priorId = null;
+  try {
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (active?.id && active.id !== tabId) priorId = active.id;
+    if (priorId) {
+      await chrome.tabs.update(tabId, { active: true });
+      await new Promise((r) => setTimeout(r, GROUP_SNIFF_FOCUS_MS));
+    }
+    return await fn();
+  } finally {
+    if (priorId) {
+      try {
+        await chrome.tabs.update(priorId, { active: true });
+      } catch {
+        /* tab closed */
+      }
+    }
+  }
+}
+
+async function refreshTabSniff(tabId, pageUrl) {
+  if (!tabId || !pageUrl || !isWebTabUrl(pageUrl)) return { urls: 0 };
+  if (VDM.isYoutubeUrl(pageUrl)) return { urls: 0 };
+
+  const candidates = new Set(store.listStreamUrlsForTab(tabId));
+  for (const u of await probePageStreamUrls(tabId)) candidates.add(u);
+
+  const expanded = new Set();
+  for (const u of candidates) {
+    expanded.add(u);
+    if (/\.m3u8/i.test(u)) {
+      for (const guess of VDM.guessMasterM3u8Candidates(u)) expanded.add(guess);
+    }
+  }
+
+  const urls = VDM.prioritizeSniffUrls(expanded);
+  let processed = 0;
+  for (const url of urls) {
+    if (/\.m3u8/i.test(url)) {
+      m3u8Pending.delete(`${tabId}:${VDM.normalizeUrl(url)}`);
+    }
+    await handleSniff(url, tabId, pageUrl, pageUrl);
+    processed++;
+  }
+  return { urls: processed };
+}
+
+async function refreshGroupTabsSniff(webTabs, anchorTabId) {
+  if (!webTabs.length) return;
+  await pushLog("info", `群組重新嗅探各分頁串流（${webTabs.length} 個）…`);
+  let total = 0;
+  for (const tab of webTabs) {
+    if (!tab.id || !tab.url) continue;
+    const run = () => refreshTabSniff(tab.id, tab.url);
+    const res = tab.active ? await run() : await withBriefTabFocus(tab.id, run);
+    total += res.urls || 0;
+    if (GROUP_SNIFF_TAB_GAP_MS > 0) {
+      await new Promise((r) => setTimeout(r, GROUP_SNIFF_TAB_GAP_MS));
+    }
+  }
+  await pushLog("info", `群組嗅探完成：${webTabs.length} 分頁、${total} 個串流 URL`);
+}
+
 async function collectGroupDownloadItems(anchorTabId) {
   let tab;
   try {
@@ -817,6 +971,7 @@ async function collectGroupDownloadItems(anchorTabId) {
   }
   const groupTabs = await chrome.tabs.query({ groupId });
   const webTabs = groupTabs.filter((t) => isWebTabUrl(t.url));
+  await refreshGroupTabsSniff(webTabs, anchorTabId);
   const rows = await Promise.all(
     webTabs.map(async (t) => {
       const pageUrl = t.url;

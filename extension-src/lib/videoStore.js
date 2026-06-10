@@ -114,6 +114,20 @@
       return this.getForTab(tabId).length;
     }
 
+    listStreamUrlsForTab(tabId) {
+      const urls = new Set();
+      for (const [key, items] of this.byPage.entries()) {
+        if (!key.startsWith(`${tabId}::`)) continue;
+        for (const v of items) {
+          if (!v.url) continue;
+          if (v.isM3u8 || /\.m3u8|\.mp4|\.m4v|videoplayback/i.test(v.url)) {
+            urls.add(v.url);
+          }
+        }
+      }
+      return [...urls];
+    }
+
     clearTab(tabId) {
       for (const key of [...this.byPage.keys()]) {
         if (key.startsWith(`${tabId}::`)) this.byPage.delete(key);
