@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from copy import deepcopy
 from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULTS = {
     "maxConcurrentTasks": 2,
@@ -16,6 +19,21 @@ DEFAULTS = {
 }
 
 _CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "VideoDownloadsManager-PC" / "settings.json"
+
+
+def app_icon_path() -> Path | None:
+    """執行時 logo.ico 路徑（開發 / PyInstaller 打包）。"""
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.append(Path(meipass) / "logo.ico")
+        candidates.append(Path(sys.executable).with_name("logo.ico"))
+    candidates.append(_PROJECT_ROOT / "logo.ico")
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
 
 
 def _ensure_parent() -> None:
@@ -80,7 +98,8 @@ def cache_root(settings: dict) -> Path:
     return root
 
 
-def browser_profile_dir(settings: dict) -> Path:
+def browser_profile_dir(settings: dict, *, with_extensions: bool = False) -> Path:
+    del with_extensions  # 擴充與一般瀏覽共用同一設定檔
     custom = settings.get("browserProfileDir") or ""
     if custom:
         path = Path(custom)

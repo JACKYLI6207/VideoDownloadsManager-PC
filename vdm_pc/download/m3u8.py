@@ -80,8 +80,6 @@ def _match_float(text: str, pattern: str) -> float | None:
 
 
 def is_video_url(url: str) -> bool:
-    lower = (url or "").lower()
-    if ".m3u8" in lower or ".mpd" in lower:
-        return True
-    path = lower.split("?")[0]
-    return path.endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ts"))
+    from vdm_pc.browser.detector import is_likely_ad_url, is_video_url as _detect
+
+    return _detect(url) and not is_likely_ad_url(url)

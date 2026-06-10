@@ -1,3 +1,4 @@
+# 本地 / 建置產物
 .venv/
 __pycache__/
 *.pyc
@@ -5,4 +6,10 @@ __pycache__/
 dist/
 build/
 _internal/
+extension/
 VideoDownloadsManagerPC.exe
+VideoDownloadsManagerPC.zip
+*.zip
+
+# 本地 IDE / 工具設定（不推送）
+.cursor/

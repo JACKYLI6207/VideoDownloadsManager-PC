@@ -1,13 +1,18 @@
 """從 Chrome 線上商店下載並解壓擴充，供 Playwright --load-extension 使用。"""
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
+import json
 import re
 import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+
+VDM_PC_EXTENSION_ID = "anokolhjgbidjccbgmahcgdagmmdoddi"
 
 _EXT_ID_RE = re.compile(r"[a-p]{32}")
 _CRX_URL = (
@@ -89,6 +94,78 @@ def download_extension(ext_id: str, dest: Path) -> Path:
         raise RuntimeError(f"下載失敗或檔案過小（{ext_id}）")
     _extract_crx(data, dest)
     return dest
+
+
+def chrome_arg_path(path: Path) -> str:
+    """Chrome 參數路徑須用絕對路徑且避免 Windows 反斜線被誤解析。"""
+    return path.resolve().as_posix()
+
+
+_KNOWN_EXT_LABELS = {
+    "bgnkhhnnamicmpeenaelnjfhikgbkllg": "AdGuard",
+    "ailoabdmgclmfmhdagmlohpjlbpffblp": "Surfshark",
+    "lnemmogegmgllangfmlpclaomcknfnbp": "Hide Images",
+    "cjpalhdlnbpafiamejdnhcphjbkeiagm": "uBlock Origin",
+}
+
+
+def _chrome_id_from_manifest_key(key_b64: str) -> str:
+    der = base64.b64decode(key_b64.strip())
+    digest = hashlib.sha256(der).digest()
+    chars: list[str] = []
+    for byte in digest[:16]:
+        chars.append(chr(ord("a") + ((byte >> 4) & 0xF)))
+        chars.append(chr(ord("a") + (byte & 0xF)))
+    return "".join(chars)
+
+
+def _read_manifest(path: Path) -> dict | None:
+    manifest = path / "manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def extension_id_from_path(path: Path) -> str:
+    """從解壓目錄名稱或 manifest key 推得擴充 ID。"""
+    name = path.name
+    if _EXT_ID_RE.fullmatch(name):
+        return name
+    data = _read_manifest(path)
+    if data:
+        ext_id = str(data.get("id") or "").strip()
+        if _EXT_ID_RE.fullmatch(ext_id):
+            return ext_id
+        key = str(data.get("key") or "").strip()
+        if key:
+            try:
+                return _chrome_id_from_manifest_key(key)
+            except (ValueError, TypeError):
+                pass
+        if data.get("description") == "VDM_PC":
+            return VDM_PC_EXTENSION_ID
+    raise ValueError(f"無法解析擴充 ID：{path}")
+
+
+def extension_label(path: Path) -> str:
+    manifest = path / "manifest.json"
+    if manifest.is_file():
+        try:
+            import json
+
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            name = str(data.get("name") or "").strip()
+            if name and not name.startswith("__MSG"):
+                return name
+        except (OSError, json.JSONDecodeError):
+            pass
+    if path.name in _KNOWN_EXT_LABELS:
+        return _KNOWN_EXT_LABELS[path.name]
+    return path.name
 
 
 def sync_extensions(urls: list[str], *, log=None) -> list[Path]:

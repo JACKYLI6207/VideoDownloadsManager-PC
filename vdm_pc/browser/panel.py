@@ -1,7 +1,10 @@
-"""瀏覽器分頁（取代擴充「可下載」）。"""
+"""瀏覽器分頁：擴充嗅探 → 待下載列表 → 加入佇列。"""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+import json
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -9,27 +12,46 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QFileDialog,
 )
 
 from vdm_pc.browser.driver import PlaywrightDriver
-from vdm_pc.browser.sniffer import MediaSniffer, SniffedResource
 from vdm_pc.browser.extension_loader import parse_extension_urls
 from vdm_pc.config import browser_profile_dir
+from vdm_pc.import_tasks import export_payload, import_tasks, normalize_url, parse_import_file
+from vdm_pc.models import DownloadTask, VideoMeta
+
+
+def _task_from_snap(snap: dict) -> DownloadTask | None:
+    if not isinstance(snap, dict):
+        return None
+    video_raw = snap.get("video")
+    if not isinstance(video_raw, dict) or not video_raw.get("url"):
+        return None
+    video = VideoMeta.from_dict(video_raw)
+    file_name = str(snap.get("fileName") or video.title or "video")
+    task = DownloadTask.create(video, file_name)
+    if snap.get("id"):
+        task.id = str(snap["id"])
+    task.status = "pending"
+    return task
 
 
 class BrowserPanel(QWidget):
     add_download = pyqtSignal(object)
+    tasks_received = pyqtSignal(list)
 
     def __init__(self, settings: dict, parent=None) -> None:
         super().__init__(parent)
         self.settings = settings
-        self.sniffer = MediaSniffer()
-        self.sniffer.on_found = self._on_resource
+        self.pending: list[DownloadTask] = []
         self.driver: PlaywrightDriver | None = None
+        self.tasks_received.connect(self._ingest_bridge_tasks)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -64,17 +86,22 @@ class BrowserPanel(QWidget):
         left = QFrame()
         left.setObjectName("card")
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("嗅探到的資源"))
+        left_layout.addWidget(QLabel("可下載清單"))
         self.resource_list = QListWidget()
-        self.resource_list.itemDoubleClicked.connect(self._add_selected)
+        self.resource_list.itemDoubleClicked.connect(self._download_one)
         left_layout.addWidget(self.resource_list, 1)
-        add_btn = QPushButton("加入下載佇列")
-        add_btn.clicked.connect(self._add_selected)
-        clear_btn = QPushButton("清除列表")
-        clear_btn.clicked.connect(self._clear_resources)
         btn_row = QHBoxLayout()
-        btn_row.addWidget(add_btn)
-        btn_row.addWidget(clear_btn)
+        for label, slot in (
+            ("全部下載", self._download_all),
+            ("下載", self._download_one),
+            ("全部清除", self._clear_all),
+            ("清除", self._clear_one),
+            ("導出", self._export_pending),
+            ("導入", self._import_pending),
+        ):
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            btn_row.addWidget(btn)
         left_layout.addLayout(btn_row)
         body.addWidget(left, 2)
 
@@ -95,30 +122,32 @@ class BrowserPanel(QWidget):
     def _start_browser(self) -> None:
         if self.driver and self.driver.isRunning():
             return
-        profile = browser_profile_dir(self.settings)
         ext_urls = parse_extension_urls(self.settings.get("browserExtensionUrls") or "")
-        self.driver = PlaywrightDriver(profile, self.sniffer, extension_urls=ext_urls)
+        profile = browser_profile_dir(self.settings)
+        self.driver = PlaywrightDriver(profile, extension_urls=ext_urls)
         self.driver.browser_ready.connect(self._on_ready)
+        self.driver.extensions_loaded.connect(self._on_extensions_loaded)
+        self.driver.status_message.connect(self._log)
         self.driver.page_closed.connect(self._on_closed)
-        self.driver.resource_detected.connect(self._on_detected)
         self.driver.error_occurred.connect(self._on_error)
         self.driver.start()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText("正在啟動…")
-        if ext_urls:
-            self._log(f"正在啟動 Chrome（含 {len(ext_urls)} 個擴充）…")
-        else:
-            self._log("正在啟動 Chrome（Playwright 持久化設定檔）…")
+        self._log("正在啟動 Chrome（含 VDM 擴充）…")
 
     def _stop_browser(self) -> None:
         if self.driver and self.driver.isRunning():
             self.driver.stop_browser()
         self._on_closed()
 
+    def _on_extensions_loaded(self, names: str) -> None:
+        self._log(f"✅ 擴充已載入：{names}")
+        self._log("請點 Chrome 工具列 VDM 圖示 → 選影片 →「添加至可下載清單」")
+
     def _on_ready(self) -> None:
         self.status_label.setText("瀏覽器就緒")
-        self._log("✅ 瀏覽器已就緒，請在彈出的 Chrome 視窗中操作")
+        self._log("✅ 瀏覽器已就緒，任務會出現於「可下載清單」")
 
     def _on_closed(self) -> None:
         self.start_btn.setEnabled(True)
@@ -127,7 +156,12 @@ class BrowserPanel(QWidget):
 
     def _on_error(self, msg: str) -> None:
         self._log(f"⚠️ {msg}")
-        self._log("請確認已安裝 Google Chrome，並執行：playwright install chrome")
+        if "chromedriver" in msg.lower() or "selenium" in msg.lower():
+            self._log("擴充安裝元件異常（Chromedriver 版本不符），請重試或重新建置 EXE")
+        elif "chrome" in msg.lower():
+            self._log("Google Chrome 安裝失敗，請檢查網路後重試，或手動安裝 Chrome 瀏覽器")
+        elif "vdm" in msg.lower() or "擴充" in msg:
+            self._log("請重新執行 build_exe.ps1 以打包 VDM 擴充")
 
     def _go(self) -> None:
         url = self.url_input.text().strip()
@@ -141,28 +175,160 @@ class BrowserPanel(QWidget):
         else:
             self._log("請先啟動瀏覽器")
 
-    def _on_detected(self, url: str, headers: dict, page_url: str, title: str) -> None:
-        res = self.sniffer.add(url, headers, page_url, title)
-        if res:
-            self._log(f"捕捉：{res.title}")
+    @pyqtSlot(list)
+    def _ingest_bridge_tasks(self, raw_tasks: list) -> None:
+        added = 0
+        seen = {normalize_url(t.video.url) for t in self._list_tasks()}
+        for snap in raw_tasks:
+            task = _task_from_snap(snap if isinstance(snap, dict) else {})
+            if not task:
+                continue
+            norm = normalize_url(task.video.url)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            self._append_list_item(task)
+            added += 1
+        if added:
+            self._log(f"擴充已加入 {added} 個任務至可下載清單")
 
-    def _on_resource(self, res: SniffedResource) -> None:
-        text = f"{res.title}\n{res.url[:120]}"
+    def _append_list_item(self, task: DownloadTask) -> None:
+        title = task.file_name.replace(".mp4", "")
+        url_hint = task.video.url[:100]
+        text = f"{title}\n{url_hint}"
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, task)
+        self.resource_list.insertItem(0, item)
+        self._rebuild_pending()
+
+    def _rebuild_pending(self) -> None:
+        self.pending = self._list_tasks()
+
+    def _list_tasks(self) -> list[DownloadTask]:
+        tasks: list[DownloadTask] = []
         for i in range(self.resource_list.count()):
             item = self.resource_list.item(i)
-            if item and item.data(Qt.ItemDataRole.UserRole).url == res.url:
-                return
-        item = QListWidgetItem(text)
-        item.setData(Qt.ItemDataRole.UserRole, res)
-        self.resource_list.insertItem(0, item)
+            if not item:
+                continue
+            task = self._resolve_list_task(item)
+            if task:
+                tasks.append(task)
+        return tasks
 
-    def _add_selected(self) -> None:
-        item = self.resource_list.currentItem()
-        if not item:
+    def _selected_item(self) -> QListWidgetItem | None:
+        selected = self.resource_list.selectedItems()
+        if selected:
+            return selected[0]
+        return self.resource_list.currentItem()
+
+    def _find_task(self, task_id: str) -> DownloadTask | None:
+        for task in self.pending:
+            if task.id == task_id:
+                return task
+        return None
+
+    def _resolve_list_task(self, item: QListWidgetItem) -> DownloadTask | None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, DownloadTask):
+            return data
+        if isinstance(data, str):
+            return self._find_task(data)
+        return None
+
+    def _download_all(self) -> None:
+        tasks = self._list_tasks()
+        if not tasks:
+            QMessageBox.information(self, "全部下載", "可下載清單為空。")
             return
-        res: SniffedResource = item.data(Qt.ItemDataRole.UserRole)
-        self.add_download.emit(res)
+        self._enqueue_tasks(tasks)
 
-    def _clear_resources(self) -> None:
-        self.sniffer.clear()
+    def _download_one(self) -> None:
+        item = self._selected_item()
+        if not item:
+            QMessageBox.information(self, "下載", "請先點選清單中的一筆影片。")
+            return
+        task = self._resolve_list_task(item)
+        if not task:
+            QMessageBox.warning(self, "下載", "無法讀取此項目，請重新從擴充加入。")
+            return
+        self._enqueue_tasks([task])
+
+    def _enqueue_tasks(self, tasks: list[DownloadTask]) -> None:
+        if not tasks:
+            return
+        added_ids: set[str] = set()
+        for task in tasks:
+            self.add_download.emit(task)
+            added_ids.add(task.id)
+
+        for i in range(self.resource_list.count() - 1, -1, -1):
+            row_item = self.resource_list.item(i)
+            if not row_item:
+                continue
+            task = self._resolve_list_task(row_item)
+            if task and task.id in added_ids:
+                self.resource_list.takeItem(i)
+
+        self._rebuild_pending()
+        self._log(f"已加入下載 {len(added_ids)} 個任務（請看「進行中」）")
+
+    def _clear_all(self) -> None:
+        if not self._list_tasks():
+            QMessageBox.information(self, "全部清除", "可下載清單為空。")
+            return
+        self.pending.clear()
         self.resource_list.clear()
+        self._log("已清除可下載清單全部項目")
+
+    def _clear_one(self) -> None:
+        item = self._selected_item()
+        if not item:
+            QMessageBox.information(self, "清除", "請先點選清單中的一筆影片。")
+            return
+        task = self._resolve_list_task(item)
+        if not task:
+            QMessageBox.warning(self, "清除", "無法讀取此項目。")
+            return
+        self.resource_list.takeItem(self.resource_list.row(item))
+        self._rebuild_pending()
+        self._log(f"已清除：{task.file_name.replace('.mp4', '')}")
+
+    def _export_pending(self) -> None:
+        tasks = self._list_tasks()
+        if not tasks:
+            QMessageBox.information(self, "導出", "可下載清單為空。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "導出待下載任務", "vdm-pending.json", "JSON (*.json)")
+        if not path:
+            return
+        payload = export_payload(tasks)
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _import_pending(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "導入待下載任務", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            raw = parse_import_file(Path(path).read_text(encoding="utf-8"))
+            seen = {normalize_url(t.video.url) for t in self._list_tasks()}
+            added = 0
+            skipped = 0
+            for snap in raw:
+                task = _task_from_snap(snap)
+                if not task:
+                    skipped += 1
+                    continue
+                norm = normalize_url(task.video.url)
+                if norm in seen:
+                    skipped += 1
+                    continue
+                seen.add(norm)
+                self._append_list_item(task)
+                added += 1
+            QMessageBox.information(
+                self,
+                "導入完成",
+                f"已導入 {added} 個任務（略過 {skipped} 個）",
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "導入失敗", str(exc))

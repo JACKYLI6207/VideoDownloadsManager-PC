@@ -1,0 +1,8 @@
+{
+  "extName": {
+    "message": "Video Downloads Manager"
+  },
+  "extDesc": {
+    "message": "偵測網頁影片、HLS 下載合併為 MP4，走瀏覽器下載目錄"
+  }
+}

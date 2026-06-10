@@ -1,4 +1,4 @@
-# Build Video Downloads Manager PC EXE（EXE 直接輸出於專案根目錄）
+# Build Video Downloads Manager PC — 單一 EXE（onefile）
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 Set-Location $Root
@@ -8,11 +8,15 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 }
 
 & .\.venv\Scripts\pip install -r requirements.txt -q
-& .\.venv\Scripts\playwright install chrome 2>$null
+
+powershell -ExecutionPolicy Bypass -File "$Root\scripts\prepare_vdm_extension.ps1"
+
+Get-Process -Name "VideoDownloadsManagerPC" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Remove-Item "$Root\_internal" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "$Root\VideoDownloadsManagerPC" -Recurse -Force -ErrorAction SilentlyContinue
 
 & .\.venv\Scripts\pyinstaller --noconfirm --clean --distpath $Root --workpath "$Root\build" vdm-pc.spec
-& "$Root\scripts\flatten_exe.ps1" -Root $Root
 
 Write-Host ""
 Write-Host "Done: $Root\VideoDownloadsManagerPC.exe"
-Write-Host "Chrome browser required for sniffing tab."
+Write-Host "Portable: copy VideoDownloadsManagerPC.exe only."

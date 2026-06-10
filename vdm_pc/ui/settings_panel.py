@@ -99,7 +99,7 @@ class SettingsPanel(QWidget):
         hint = QLabel(
             f"片段暫存：{cache_root(settings)}\n"
             f"擴充檔案：{extensions_root()}\n"
-            "擴充會在啟動瀏覽器時自動載入（無需從商店手動安裝）。\n"
+            "有擴充時會自動安裝至內建 Chrome；請點工具列圖示開啟面板。\n"
             "任務數／連線數可自訂；全局片段並行硬上限仍為 108。\n"
             "HLS 合併使用內建 FFmpeg，輸出標準 MP4。"
         )
