@@ -8,8 +8,6 @@ build/
 _internal/
 extension/
 VideoDownloadsManagerPC.exe
+Video-Downloads-Manager-Windows.exe
 VideoDownloadsManagerPC.zip
 *.zip
-
-# 本地 IDE / 工具設定（不推送）
-.cursor/

@@ -1,0 +1,54 @@
+---
+description: PC EXE 專案唯一路徑、Git 備份、建置、繁中回覆（新對話必讀）
+alwaysApply: true
+---
+
+# Video Downloads Manager PC — 工作流程
+
+## 專案位置（唯一、強制）
+
+**所有 PC 程式碼、擴充原始碼、建置產物，一律在此目錄：**
+
+`C:\Users\Jacky-PC-New\Desktop\Project\VIideo-Downloads-Manager-Chrome-Windows\VIideo-Downloads-Manager-Windows`
+
+本專案**自包含**，不依賴其他專案資料夾。
+
+| 子目錄 | 用途 |
+|--------|------|
+| `extension-src/` | VDM PC 擴充（`manifest-pc.json`、`panel-pc.*`） |
+| `vdm_pc/` | Python 主程式 |
+| `scripts/` | `prepare_vdm_extension.ps1`、`backup.ps1` |
+
+- Cursor 工作區若開在其他資料夾，仍以上述**絕對路徑**讀寫
+- 脈絡摘要：`.cursor/CONTEXT.md`
+
+## 改動前備份（Git）
+
+```powershell
+cd C:\Users\Jacky-PC-New\Desktop\Project\VIideo-Downloads-Manager-Chrome-Windows\VIideo-Downloads-Manager-Windows
+powershell -ExecutionPolicy Bypass -File scripts\backup.ps1
+```
+
+## 建置 EXE（改碼後必做）
+
+```powershell
+cd C:\Users\Jacky-PC-New\Desktop\Project\VIideo-Downloads-Manager-Chrome-Windows\VIideo-Downloads-Manager-Windows
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+- `prepare_vdm_extension.ps1`：`extension-src/` → `extension/<id>/`
+- 產出：單一 `VideoDownloadsManagerPC.exe`（onefile，約 78 MB）
+- 建置前**關閉執行中 EXE**
+- 改擴充後須 bump `extension-src/manifest-pc.json` version
+
+## 執行 / 測試
+
+1. 執行 `VideoDownloadsManagerPC.exe`（或 `run.bat` 開發模式）
+2. 「瀏覽器」→ 啟動 Chrome → 點工具列 VDM 圖示
+3. 可攜：只需複製單一 EXE；未裝 Chrome 時首次啟動瀏覽器會自動安裝
+
+## 溝通與風格
+
+- 回覆使用者：**繁體中文**
+- 最小 diff；沿用 `vdm_pc` 套件結構
+- 架構細節見 `pc-architecture.mdc`

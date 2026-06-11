@@ -1,0 +1,80 @@
+---
+description: PC EXE 架構、擴充整合、下載引擎、建置
+globs: vdm_pc/**/*
+alwaysApply: false
+---
+
+# PC 架構要點
+
+> 程式根目錄：`C:\Users\Jacky-PC-New\Desktop\Project\VIideo-Downloads-Manager-Chrome-Windows\VIideo-Downloads-Manager-Windows`
+
+## 分工
+
+| 元件 | 職責 |
+|------|------|
+| 內建 VDM 擴充 | 嗅探、面板 UI、推送任務、封面下載（chrome.downloads） |
+| EXE bridge | `127.0.0.1:18429` 接收任務 → 可下載清單 |
+| EXE 下載引擎 | 實際 HLS/MP4 下載與合併 |
+
+擴充原始碼：`extension-src/`（建置打包至 `sys._MEIPASS/vdm-extension/`）
+
+## UI
+
+- PyQt6（僅 QtCore / QtGui / QtWidgets）：`vdm_pc/app.py`
+- 分頁：瀏覽器 / 進行中 / 已完成 / 日誌 / 設定
+- 瀏覽器分頁左側：可下載清單雙欄表（影片名稱 / 解析度；`guess_quality` 從 URL 推斷）
+  - 點欄位標題排序（名稱字串、解析度數值）
+  - 影片名稱為 `#copyNameBtn` 按鈕，點擊複製名稱（去掉 `.mp4`）；底層 `_NameTableItem` 留白避免與按鈕文字重疊
+- 群組添加前：`refreshGroupTabsSniff` 注入腳本並重解析 m3u8（`service_worker.js`）
+- HLS 進行中：下載 / 合併 各一進度條
+
+## 瀏覽器與擴充
+
+| 路徑 | 職責 |
+|------|------|
+| `vdm_pc/browser/driver.py` | 啟動系統 Chrome、BiDi 載入 VDM |
+| `vdm_pc/browser/chrome_install.py` | 未安裝時自動下載安裝 Google Chrome |
+| `vdm_pc/browser/chrome_paths.py` | `ensure_chrome_exe()` 入口 |
+| `vdm_pc/browser/extension_install.py` | 設定檔同步、BiDi 安裝、Chromedriver 版本對齊 |
+| `vdm_pc/browser/extension_loader.py` | 第三方 CRX / 本機路徑 |
+| `vdm_pc/extension_bundle.py` | 執行時擴充路徑 `sys._MEIPASS/vdm-extension` |
+| `scripts/prepare_vdm_extension.ps1` | 建置前 `extension-src/` → `extension/<id>/` |
+
+- 擴充 ID：`anokolhjgbidjccbgmahcgdagmmdoddi`
+- **禁止** `--load-extension` 載入 VDM
+- **禁止**內建 Chrome for Testing（已移除）
+- 封面：`panel-pc.js` 直接用 `chrome.downloads`，不走 `START_DOWNLOADS`
+
+## Bridge
+
+| 路徑 | 職責 |
+|------|------|
+| `vdm_pc/bridge_server.py` | `POST /push-tasks` |
+| `extension-src/lib/pcBridge.js` | 推送任務 JSON |
+
+## 下載引擎
+
+| 路徑 | 職責 |
+|------|------|
+| `vdm_pc/download/engine.py` | 隊列、暫停/繼續、自動重試 |
+| `vdm_pc/download/disk_store.py` | 片段暫存、串流合併 |
+| `vdm_pc/download/ffmpeg_util.py` | 內建 FFmpeg、HTTP Range |
+| `vdm_pc/persist.py` | 任務 JSON |
+
+- `_wait_queue` + `_running`；上限 `maxConcurrentTasks`
+- 全局片段槽：`min(108, 任務數×連線數)`
+- HLS：`.part` → `.ts`，邊下邊合併，`merge.json`
+
+## 建置（onefile）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+- `vdm-pc.spec` → PyInstaller **onefile**，`icon=logo.ico`
+- 精簡：`collect_all` 僅用於 `imageio_ffmpeg`；PyQt6/Selenium 依 import 自動收集
+- 產物：單一 `VideoDownloadsManagerPC.exe`（約 78 MB，FFmpeg 佔大部分）
+
+## 不支援
+
+- YouTube
