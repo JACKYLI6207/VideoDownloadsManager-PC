@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -21,6 +22,8 @@ from PyQt6.QtWidgets import (
     QWidget,
     QFileDialog,
 )
+
+_LIST_ROW_HEIGHT = 44
 
 from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.extension_loader import parse_extension_urls
@@ -127,6 +130,8 @@ class BrowserPanel(QWidget):
         self.resource_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.resource_table.setColumnWidth(1, 72)
         self.resource_table.verticalHeader().setVisible(False)
+        self.resource_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.resource_table.verticalHeader().setDefaultSectionSize(_LIST_ROW_HEIGHT)
         self.resource_table.setShowGrid(False)
         self.resource_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.resource_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -166,13 +171,16 @@ class BrowserPanel(QWidget):
 
     def _make_name_cell(self, task: DownloadTask) -> QWidget:
         cell = QWidget()
+        cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QHBoxLayout(cell)
-        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(0)
         name_btn = QPushButton(task.file_name)
         name_btn.setObjectName("copyNameBtn")
         name_btn.setToolTip("點擊複製名稱")
         name_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        name_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        name_btn.setMinimumHeight(30)
         name = _copyable_name(task.file_name)
         name_btn.clicked.connect(lambda _checked=False, n=name: self._copy_video_name(n))
         layout.addWidget(name_btn, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -265,10 +273,13 @@ class BrowserPanel(QWidget):
         name_item.setData(Qt.ItemDataRole.UserRole, task)
         quality = _resolution_quality(task)
         res_item = _ResolutionTableItem(_resolution_label(task), quality)
-        res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        res_item.setTextAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        )
         self.resource_table.setItem(row, 0, name_item)
         self.resource_table.setCellWidget(row, 0, self._make_name_cell(task))
         self.resource_table.setItem(row, 1, res_item)
+        self.resource_table.setRowHeight(row, _LIST_ROW_HEIGHT)
         self.resource_table.setSortingEnabled(sorting)
         self._rebuild_pending()
 
