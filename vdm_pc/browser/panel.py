@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -39,6 +40,12 @@ def _resolution_quality(task: DownloadTask) -> int:
 
 def _resolution_label(task: DownloadTask) -> str:
     return format_resolution(_resolution_quality(task))
+
+
+def _copyable_name(file_name: str) -> str:
+    if file_name.lower().endswith(".mp4"):
+        return file_name[:-4]
+    return file_name
 
 
 class _ResolutionTableItem(QTableWidgetItem):
@@ -125,6 +132,7 @@ class BrowserPanel(QWidget):
         self.resource_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.resource_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.resource_table.setAlternatingRowColors(True)
+        self.resource_table.setSortingEnabled(True)
         self.resource_table.cellDoubleClicked.connect(self._on_row_double_clicked)
         left_layout.addWidget(self.resource_table, 1)
         btn_row = QHBoxLayout()
@@ -155,6 +163,26 @@ class BrowserPanel(QWidget):
 
     def _log(self, msg: str) -> None:
         self.log_area.append(msg)
+
+    def _make_name_cell(self, task: DownloadTask) -> QWidget:
+        cell = QWidget()
+        layout = QHBoxLayout(cell)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(6)
+        label = QLabel(task.file_name)
+        label.setToolTip(task.file_name)
+        copy_btn = QPushButton("複製")
+        copy_btn.setFixedWidth(52)
+        copy_btn.setToolTip("複製名稱")
+        name = _copyable_name(task.file_name)
+        copy_btn.clicked.connect(lambda _checked=False, n=name: self._copy_video_name(n))
+        layout.addWidget(label, 1)
+        layout.addWidget(copy_btn, 0)
+        return cell
+
+    def _copy_video_name(self, name: str) -> None:
+        QGuiApplication.clipboard().setText(name)
+        self._log(f"已複製名稱：{name}")
 
     def _start_browser(self) -> None:
         if self.driver and self.driver.isRunning():
@@ -230,14 +258,19 @@ class BrowserPanel(QWidget):
             self._log(f"擴充已加入 {added} 個任務至可下載清單")
 
     def _append_list_item(self, task: DownloadTask) -> None:
-        row = 0
+        sorting = self.resource_table.isSortingEnabled()
+        self.resource_table.setSortingEnabled(False)
+        row = self.resource_table.rowCount()
         self.resource_table.insertRow(row)
         name_item = QTableWidgetItem(task.file_name)
         name_item.setData(Qt.ItemDataRole.UserRole, task)
-        res_item = QTableWidgetItem(_resolution_label(task))
+        quality = _resolution_quality(task)
+        res_item = _ResolutionTableItem(_resolution_label(task), quality)
         res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.resource_table.setItem(row, 0, name_item)
+        self.resource_table.setCellWidget(row, 0, self._make_name_cell(task))
         self.resource_table.setItem(row, 1, res_item)
+        self.resource_table.setSortingEnabled(sorting)
         self._rebuild_pending()
 
     def _rebuild_pending(self) -> None:
