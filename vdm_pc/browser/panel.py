@@ -49,6 +49,20 @@ def _copyable_name(file_name: str) -> str:
     return file_name
 
 
+class _NameTableItem(QTableWidgetItem):
+    """影片名稱欄位：文字由按鈕顯示，item 本身留白避免重疊。"""
+
+    def __init__(self, file_name: str, task: DownloadTask) -> None:
+        super().__init__("")
+        self._sort_key = file_name
+        self.setData(Qt.ItemDataRole.UserRole, task)
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:  # type: ignore[override]
+        if isinstance(other, _NameTableItem):
+            return self._sort_key.lower() < other._sort_key.lower()
+        return super().__lt__(other)
+
+
 class _ResolutionTableItem(QTableWidgetItem):
     """解析度欄位以數值排序（非字串）。"""
 
@@ -78,7 +92,7 @@ def _task_from_snap(snap: dict) -> DownloadTask | None:
 
 
 class BrowserPanel(QWidget):
-    _LIST_ROW_HEIGHT = 40
+    _LIST_ROW_HEIGHT = 42
 
     add_download = pyqtSignal(object)
     tasks_received = pyqtSignal(list)
@@ -261,8 +275,7 @@ class BrowserPanel(QWidget):
         self.resource_table.setSortingEnabled(False)
         row = self.resource_table.rowCount()
         self.resource_table.insertRow(row)
-        name_item = QTableWidgetItem(task.file_name)
-        name_item.setData(Qt.ItemDataRole.UserRole, task)
+        name_item = _NameTableItem(task.file_name, task)
         quality = _resolution_quality(task)
         res_item = _ResolutionTableItem(_resolution_label(task), quality)
         res_item.setTextAlignment(

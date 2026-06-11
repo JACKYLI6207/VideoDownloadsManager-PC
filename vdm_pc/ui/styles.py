@@ -35,7 +35,7 @@ QPushButton#primary {
   border-color: #2563eb;
 }
 QPushButton#copyNameBtn {
-  margin: 4px 8px;
+  margin: 4px 0 4px 8px;
   padding: 2px 10px;
   font-size: 13px;
   border: 1px solid #c5ced8;
