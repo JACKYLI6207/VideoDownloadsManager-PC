@@ -28,14 +28,30 @@ from vdm_pc.import_tasks import export_payload, import_tasks, normalize_url, par
 from vdm_pc.models import DownloadTask, VideoMeta, format_resolution, resolve_quality
 
 
-def _resolution_label(task: DownloadTask) -> str:
-    q = resolve_quality(
+def _resolution_quality(task: DownloadTask) -> int:
+    return resolve_quality(
         task.video.url,
         task.file_name,
         task.video.title,
         quality=task.video.quality,
     )
-    return format_resolution(q)
+
+
+def _resolution_label(task: DownloadTask) -> str:
+    return format_resolution(_resolution_quality(task))
+
+
+class _ResolutionTableItem(QTableWidgetItem):
+    """解析度欄位以數值排序（非字串）。"""
+
+    def __init__(self, text: str, quality: int) -> None:
+        super().__init__(text)
+        self._quality = quality
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:  # type: ignore[override]
+        if isinstance(other, _ResolutionTableItem):
+            return self._quality < other._quality
+        return super().__lt__(other)
 
 
 def _task_from_snap(snap: dict) -> DownloadTask | None:
