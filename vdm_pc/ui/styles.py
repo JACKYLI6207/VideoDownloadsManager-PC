@@ -34,6 +34,16 @@ QPushButton#primary {
   color: white;
   border-color: #2563eb;
 }
+QPushButton#copyNameBtn {
+  padding: 4px 10px;
+  border: 1px solid #c5ced8;
+  border-radius: 6px;
+  background: #ffffff;
+}
+QPushButton#copyNameBtn:hover {
+  background: #eef3f8;
+  border-color: #94a3b8;
+}
 QFrame#card {
   background: #ffffff;
   border: 1px solid #d8dee6;
