@@ -23,8 +23,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
 )
 
-_LIST_ROW_HEIGHT = 44
-
 from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.extension_loader import parse_extension_urls
 from vdm_pc.config import browser_profile_dir
@@ -80,6 +78,8 @@ def _task_from_snap(snap: dict) -> DownloadTask | None:
 
 
 class BrowserPanel(QWidget):
+    _LIST_ROW_HEIGHT = 40
+
     add_download = pyqtSignal(object)
     tasks_received = pyqtSignal(list)
 
@@ -131,7 +131,7 @@ class BrowserPanel(QWidget):
         self.resource_table.setColumnWidth(1, 72)
         self.resource_table.verticalHeader().setVisible(False)
         self.resource_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        self.resource_table.verticalHeader().setDefaultSectionSize(_LIST_ROW_HEIGHT)
+        self.resource_table.verticalHeader().setDefaultSectionSize(self._LIST_ROW_HEIGHT)
         self.resource_table.setShowGrid(False)
         self.resource_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.resource_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -169,23 +169,15 @@ class BrowserPanel(QWidget):
     def _log(self, msg: str) -> None:
         self.log_area.append(msg)
 
-    def _make_name_cell(self, task: DownloadTask) -> QWidget:
-        cell = QWidget()
-        cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout = QHBoxLayout(cell)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(0)
+    def _make_name_button(self, task: DownloadTask) -> QPushButton:
         name_btn = QPushButton(task.file_name)
         name_btn.setObjectName("copyNameBtn")
         name_btn.setToolTip("點擊複製名稱")
         name_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         name_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        name_btn.setMinimumHeight(30)
         name = _copyable_name(task.file_name)
         name_btn.clicked.connect(lambda _checked=False, n=name: self._copy_video_name(n))
-        layout.addWidget(name_btn, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        layout.addStretch(1)
-        return cell
+        return name_btn
 
     def _copy_video_name(self, name: str) -> None:
         QGuiApplication.clipboard().setText(name)
@@ -277,9 +269,9 @@ class BrowserPanel(QWidget):
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
         )
         self.resource_table.setItem(row, 0, name_item)
-        self.resource_table.setCellWidget(row, 0, self._make_name_cell(task))
+        self.resource_table.setCellWidget(row, 0, self._make_name_button(task))
         self.resource_table.setItem(row, 1, res_item)
-        self.resource_table.setRowHeight(row, _LIST_ROW_HEIGHT)
+        self.resource_table.setRowHeight(row, self._LIST_ROW_HEIGHT)
         self.resource_table.setSortingEnabled(sorting)
         self._rebuild_pending()
 

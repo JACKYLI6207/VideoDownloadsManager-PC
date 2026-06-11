@@ -35,7 +35,8 @@ QPushButton#primary {
   border-color: #2563eb;
 }
 QPushButton#copyNameBtn {
-  padding: 6px 12px;
+  margin: 4px 8px;
+  padding: 2px 10px;
   font-size: 13px;
   border: 1px solid #c5ced8;
   border-radius: 6px;
@@ -63,7 +64,7 @@ QTableWidget {
   outline: none;
 }
 QTableWidget::item {
-  padding: 10px 10px;
+  padding: 4px 8px;
   border-bottom: 1px solid #e8edf2;
 }
 QHeaderView::section {
