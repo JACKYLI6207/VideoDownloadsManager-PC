@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Downloads Manager PC",
-  "version": "1.2.9",
+  "version": "1.2.10",
   "description": "VDM_PC",
   "key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCuOKHISNcqJK/RxWou7ePbLg+jcO8TYKZ3mGOmW6iZSILUuPGk1jn0I21oW0yCAPBnJS0Gv/QkcehC+PxRS2pCUPBk+2pr5vMER+5vK2A4T+RaqJ0b6lYwFg3c3FO+4fIBfZA1C8JpbcW7xSuUciE98vqiHaTGRuVmyoICzQIDAQAB",
   "default_locale": "zh_TW",

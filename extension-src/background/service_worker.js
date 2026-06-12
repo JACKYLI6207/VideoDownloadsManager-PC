@@ -876,15 +876,6 @@ async function probePageStreamUrls(tabId) {
             }
           }
         }
-        for (const v of document.querySelectorAll("video")) {
-          try {
-            v.muted = true;
-            const pr = v.play();
-            if (pr?.catch) pr.catch(() => {});
-          } catch {
-            /* ignore */
-          }
-        }
         return [...urls];
       },
     });
@@ -942,14 +933,17 @@ async function refreshTabSniff(tabId, pageUrl) {
   return { urls: processed };
 }
 
-async function refreshGroupTabsSniff(webTabs, anchorTabId) {
+async function refreshGroupTabsSniff(webTabs) {
   if (!webTabs.length) return;
   await pushLog("info", `群組重新嗅探各分頁串流（${webTabs.length} 個）…`);
   let total = 0;
   for (const tab of webTabs) {
     if (!tab.id || !tab.url) continue;
     const run = () => refreshTabSniff(tab.id, tab.url);
-    const res = tab.active ? await run() : await withBriefTabFocus(tab.id, run);
+    let res = await run();
+    if (!res.urls && !tab.active && !VDM.isPcMode()) {
+      res = await withBriefTabFocus(tab.id, run);
+    }
     total += res.urls || 0;
     if (GROUP_SNIFF_TAB_GAP_MS > 0) {
       await new Promise((r) => setTimeout(r, GROUP_SNIFF_TAB_GAP_MS));
@@ -958,7 +952,11 @@ async function refreshGroupTabsSniff(webTabs, anchorTabId) {
   await pushLog("info", `群組嗅探完成：${webTabs.length} 分頁、${total} 個串流 URL`);
 }
 
-async function collectGroupDownloadItems(anchorTabId) {
+function groupTabsNeedResniff(webTabs) {
+  return webTabs.some((t) => !pickBestVideo(store.getForTab(t.id)));
+}
+
+async function collectGroupDownloadItems(anchorTabId, { resniff } = {}) {
   let tab;
   try {
     tab = await chrome.tabs.get(anchorTabId);
@@ -971,7 +969,11 @@ async function collectGroupDownloadItems(anchorTabId) {
   }
   const groupTabs = await chrome.tabs.query({ groupId });
   const webTabs = groupTabs.filter((t) => isWebTabUrl(t.url));
-  await refreshGroupTabsSniff(webTabs, anchorTabId);
+  const shouldResniff =
+    resniff !== false && (!VDM.isPcMode() || groupTabsNeedResniff(webTabs));
+  if (shouldResniff) {
+    await refreshGroupTabsSniff(webTabs);
+  }
   const rows = await Promise.all(
     webTabs.map(async (t) => {
       const pageUrl = t.url;
