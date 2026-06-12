@@ -1,7 +1,7 @@
 # 新對話必讀 — Video Downloads Manager PC（EXE）
 
-> **最後更新**：2026-06-11  
-> **內建擴充版本**：1.2.9（`extension-src/manifest-pc.json`）  
+> **最後更新**：2026-06-12  
+> **內建擴充版本**：1.2.12（`extension-src/manifest-pc.json`）  
 > **EXE 圖示**：`logo.ico`  
 > **產物大小**：約 78 MB（onefile，含 FFmpeg）
 
@@ -132,7 +132,7 @@ powershell -ExecutionPolicy Bypass -File scripts\backup.ps1
 | 按鈕 | 行為 |
 |------|------|
 | 添加至可下載清單 | POST → `127.0.0.1:18429/push-tasks` |
-| 群組添加至可下載清單 | 先重新嗅探各分頁（注入腳本 + 短暫切換背景分頁 + 重解析 m3u8），再 POST 最高畫質 |
+| 群組添加至可下載清單 | 面板依群組各分頁快取取最高畫質 → `START_GROUP_DOWNLOADS`（`items` + `resniff: false`）→ POST；**PC 模式不重新嗅探、不切換分頁** |
 | 下載封面 / 群組下載封面 | `chrome.downloads` 存 `.jpg`（不進 PC 清單） |
 
 擴充 ID：`anokolhjgbidjccbgmahcgdagmmdoddi`（manifest `key` 計算）
@@ -179,3 +179,5 @@ powershell -ExecutionPolicy Bypass -File scripts\backup.ps1
 - `prepare_vdm_extension.ps1` 腳本註解須 **ASCII**，避免 PowerShell 5.1 編碼誤解析 `$ExtId`
 - 封面下載在 `panel-pc.js` 直接呼叫 `chrome.downloads`，不走 `START_DOWNLOADS`
 - **不支援** YouTube
+- 擴充更新後須**關閉並從 EXE 重啟瀏覽器**；面板與 Service Worker 版本不一致會出現「未知指令」（例如曾短暫使用 `PUSH_PC_DOWNLOADS`）
+- `extension_install.py`：manifest 版本變更時強制同步擴充至 Chrome 設定檔

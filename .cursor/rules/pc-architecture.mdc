@@ -25,7 +25,7 @@ alwaysApply: false
 - 瀏覽器分頁左側：可下載清單雙欄表（影片名稱 / 解析度；`guess_quality` 從 URL 推斷）
   - 點欄位標題排序（名稱字串、解析度數值）
   - 影片名稱為 `#copyNameBtn` 按鈕，點擊複製名稱（去掉 `.mp4`）；底層 `_NameTableItem` 留白避免與按鈕文字重疊
-- 群組添加前：`refreshGroupTabsSniff` 注入腳本並重解析 m3u8（`service_worker.js`）
+- 群組添加（PC）：`panel-pc.js` 以 `GET_VIDEOS` 彙整群組 → `START_GROUP_DOWNLOADS` 帶 `items`/`resniff:false` → `pushDownloadItemsToPc`；僅非 PC 或缺快取時才 `refreshGroupTabsSniff`
 - HLS 進行中：下載 / 合併 各一進度條
 
 ## 瀏覽器與擴充

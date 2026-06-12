@@ -90,8 +90,11 @@ def seed_extensions_to_profile(ext_paths: list[Path], profile_dir: Path, *, log=
             continue
 
         installed_dir = _installed_extension_dir(profile_dir, ext_id)
-        if installed_dir and _extension_sync_key(path) == _extension_sync_key(installed_dir):
-            continue
+        if installed_dir:
+            same_version = _extension_version(installed_dir) == version
+            same_payload = _extension_sync_key(path) == _extension_sync_key(installed_dir)
+            if same_version and same_payload:
+                continue
 
         ext_root = profile_dir / "Default" / "Extensions" / ext_id
         if ext_root.is_dir():

@@ -1497,13 +1497,35 @@ async function handleMessage(msg, sender) {
       const resolved = await resolveTargetTabId(msg.tabId);
       return getTabGroupInfo(resolved.tabId);
     }
+    case "PUSH_PC_DOWNLOADS": {
+      await loadSettings();
+      if (!VDM.isPcMode()) return { error: "非 PC 模式" };
+      const items = Array.isArray(msg.items) ? msg.items : [];
+      if (!items.length) return { error: "沒有可推送的項目" };
+      try {
+        const started = await pushDownloadItemsToPc(items);
+        if (!started.length) return { error: "選取的影片無法送至 PC 版" };
+        return { tasks: started, count: started.length };
+      } catch (err) {
+        const msgErr = err?.message || String(err);
+        await pushLog("error", `送至 PC 失敗：${msgErr}`);
+        return { error: msgErr };
+      }
+    }
     case "START_GROUP_DOWNLOADS": {
       await loadSettings();
       const resolved = await resolveTargetTabId(msg.tabId);
       if (!resolved.tabId) {
         return { error: "找不到目前分頁" };
       }
-      const collected = await collectGroupDownloadItems(resolved.tabId);
+      let collected;
+      if (Array.isArray(msg.items) && msg.items.length) {
+        collected = { items: msg.items };
+      } else {
+        collected = await collectGroupDownloadItems(resolved.tabId, {
+          resniff: msg.resniff !== false && !VDM.isPcMode(),
+        });
+      }
       if (collected.error) return { error: collected.error };
       if (!collected.items?.length) {
         return { error: "群組內沒有偵測到可下載影片（請先在各分頁播放影片）" };

@@ -346,7 +346,7 @@ async function collectSelectedCoverItems(videoIds) {
   return list.map((video) => ({ video, tabId, pageUrl, pageTitle }));
 }
 
-async function collectGroupCoverItems() {
+async function collectGroupItemsFromTabs() {
   await refreshContext();
   const info = await api("GET_TAB_GROUP_INFO");
   if (!info.inGroup || info.groupId == null) throw new Error("目前分頁不在任何群組中");
@@ -367,6 +367,10 @@ async function collectGroupCoverItems() {
   }
   if (!items.length) throw new Error("群組內沒有偵測到可下載影片");
   return items;
+}
+
+async function collectGroupCoverItems() {
+  return collectGroupItemsFromTabs();
 }
 
 async function withButton(btn, busyText, run) {
@@ -404,7 +408,8 @@ $("#groupDownloadBtn")?.addEventListener("click", async (e) => {
   const btn = $("#groupDownloadBtn");
   try {
     await withButton(btn, "傳送中…", async () => {
-      const res = await api("START_GROUP_DOWNLOADS");
+      const items = await collectGroupItemsFromTabs();
+      const res = await api("START_GROUP_DOWNLOADS", { items, resniff: false });
       if (!res.tasks?.length) throw new Error(res.error || "無法開始群組添加");
       showToast(`群組已添加 ${res.tasks.length} 個至 PC 可下載清單`, "info");
     });
