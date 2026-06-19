@@ -450,6 +450,30 @@ $("#groupCoverDownloadBtn")?.addEventListener("click", async (e) => {
   }
 });
 
+$("#openBatchSearch")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  let tabId = currentTabId;
+  chrome.tabs
+    .query({ active: true, lastFocusedWindow: true })
+    .then(([tab]) => {
+      if (tab?.id && tab.url && !tab.url.startsWith("chrome-extension")) {
+        tabId = tab.id;
+      }
+      const qs = tabId ? `?sourceTabId=${tabId}` : "";
+      return chrome.tabs.create({
+        url: chrome.runtime.getURL(`sidepanel/batch-search.html${qs}`),
+        active: true,
+      });
+    })
+    .catch(() => {
+      chrome.tabs.create({
+        url: chrome.runtime.getURL("sidepanel/batch-search.html"),
+        active: true,
+      });
+    });
+});
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "VIDEOS_UPDATED") {
     loadVideos();

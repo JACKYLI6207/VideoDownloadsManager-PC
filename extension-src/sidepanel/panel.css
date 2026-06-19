@@ -397,6 +397,14 @@ body.pc-mode .footer .btn.cover-dl {
   padding: 8px;
 }
 
+body.pc-mode .batch-hint {
+  margin: 0;
+  padding: 6px 14px 0;
+  font-size: 11px;
+  color: #888;
+  line-height: 1.45;
+}
+
 .log-list {
   display: flex;
   flex-direction: column;

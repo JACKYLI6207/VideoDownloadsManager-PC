@@ -6,7 +6,8 @@ importScripts(
   "../lib/pcBridge.js",
   "../lib/blobStore.js",
   "../lib/opfsStore.js",
-  "../lib/downloadEngine.js"
+  "../lib/downloadEngine.js",
+  "../lib/siteSearch.js"
 );
 
 const store = new VDM.VideoStore();
@@ -115,6 +116,331 @@ async function openManagerTab(sourceTabId) {
   return { tabId: tab.id, reused: false };
 }
 
+const BATCH_SEARCH_PAGE = "sidepanel/batch-search.html";
+let batchSearchCancel = false;
+let batchSearchRunning = false;
+
+function batchSearchPageUrl(sourceTabId) {
+  const params = new URLSearchParams();
+  if (sourceTabId) params.set("sourceTabId", String(sourceTabId));
+  const qs = params.toString();
+  return `${chrome.runtime.getURL(BATCH_SEARCH_PAGE)}${qs ? `?${qs}` : ""}`;
+}
+
+async function openBatchSearchTab(sourceTabId) {
+  const targetUrl = batchSearchPageUrl(sourceTabId);
+  const base = chrome.runtime.getURL(BATCH_SEARCH_PAGE);
+  const tabs = await chrome.tabs.query({});
+  const existing = tabs.find((t) => t.url?.startsWith(base.split("?")[0]));
+  if (existing) {
+    await chrome.tabs.update(existing.id, { url: targetUrl, active: true });
+    return { tabId: existing.id, reused: true };
+  }
+  const tab = await chrome.tabs.create({ url: targetUrl, active: true });
+  return { tabId: tab.id, reused: false };
+}
+
+function broadcastBatchProgress(payload) {
+  broadcast({ type: "BATCH_SEARCH_PROGRESS", ...payload });
+}
+
+async function waitTabComplete(tabId, timeoutMs = 25000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (batchSearchCancel) throw new Error("cancelled");
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") return tab;
+    } catch {
+      throw new Error("分頁已關閉");
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error("載入逾時");
+}
+
+async function detectSiteSearchFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) {
+    throw new Error("無法在來源分頁執行偵測");
+  }
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    func: () => {
+      const fieldNames = [
+        "keyword",
+        "keywords",
+        "q",
+        "query",
+        "search",
+        "wd",
+        "k",
+        "search_query",
+        "text",
+        "s",
+      ];
+      const origin = location.origin;
+
+      try {
+        const current = new URL(location.href);
+        for (const key of fieldNames) {
+          const val = current.searchParams.get(key);
+          if (!val || val.length < 2) continue;
+          const encoded = encodeURIComponent(val);
+          let template = location.href;
+          if (template.includes(encoded)) template = template.split(encoded).join("{query}");
+          else template = template.split(val).join("{query}");
+          return { mode: "url", template, field: key, origin, source: "current-url" };
+        }
+      } catch {
+        /* ignore */
+      }
+
+      const inputSelectors = [
+        'input[type="search"]',
+        'input[name*="keyword" i]',
+        'input[name*="search" i]',
+        'input[id*="search" i]',
+        'input[placeholder*="搜" i]',
+        'input[placeholder*="search" i]',
+        'input[type="text"]',
+      ];
+      let searchInput = null;
+      for (const sel of inputSelectors) {
+        for (const inp of document.querySelectorAll(sel)) {
+          if (inp.type === "hidden" || inp.disabled) continue;
+          const hint = `${inp.name || ""} ${inp.id || ""} ${inp.placeholder || ""} ${inp.className || ""}`.toLowerCase();
+          if (fieldNames.some((n) => hint.includes(n)) || /search|搜|検索/.test(hint)) {
+            searchInput = inp;
+            break;
+          }
+        }
+        if (searchInput) break;
+      }
+      if (!searchInput) {
+        for (const form of document.querySelectorAll("form")) {
+          const hint = `${form.action || ""} ${form.id || ""} ${form.className || ""}`.toLowerCase();
+          if (!/search|搜|検索/.test(hint)) continue;
+          const inp = form.querySelector('input[type="search"], input[type="text"], input:not([type])');
+          if (inp && inp.type !== "hidden") {
+            searchInput = inp;
+            break;
+          }
+        }
+      }
+      if (searchInput) {
+        const form = searchInput.closest("form");
+        const fieldName =
+          searchInput.name ||
+          searchInput.id ||
+          (fieldNames.find((n) => (searchInput.name || searchInput.id || "").toLowerCase().includes(n)) ?? "keyword");
+        if (form?.action) {
+          try {
+            const action = new URL(form.action, location.href);
+            const method = (form.method || "get").toLowerCase();
+            if (method === "get") {
+              const params = new URLSearchParams(action.search);
+              for (const el of form.querySelectorAll("input, select, textarea")) {
+                if (!el.name || el === searchInput) continue;
+                if (el.type === "submit" || el.type === "button" || el.type === "hidden") continue;
+                if (el.value) params.set(el.name, el.value);
+              }
+              params.set(fieldName, "{query}");
+              const qs = params.toString();
+              const template = `${action.origin}${action.pathname}${qs ? `?${qs}` : ""}`;
+              return { mode: "url", template, field: fieldName, origin: action.origin, source: "form" };
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        return {
+          mode: "url",
+          template: `${origin}/search?${fieldName}={query}`,
+          field: fieldName,
+          origin,
+          source: "input-guess",
+          fallback: true,
+        };
+      }
+      return {
+        mode: "url",
+        template: `${origin}/search?keyword={query}`,
+        field: "keyword",
+        origin,
+        source: "default-guess",
+        fallback: true,
+      };
+    },
+  });
+  if (!result?.template) throw new Error("無法偵測網站搜索格式");
+  return result;
+}
+
+async function pickFirstResultFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return "";
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: () => {
+        const bad =
+          /\/search(?:\/|\?|$)|\/login|\/register|\/signup|\/tags?(?:\/|\?|$)|\/categories?(?:\/|\?|$)|\/actress|\/actor|\/genre|\/ranking|\/contact|\/about|\/help|#$|javascript:/i;
+        const abs = (u) => {
+          try {
+            return new URL(u, location.href).href;
+          } catch {
+            return "";
+          }
+        };
+        const sameOrigin = (u) => {
+          try {
+            return new URL(u).origin === location.origin;
+          } catch {
+            return false;
+          }
+        };
+        const skipContainer = (el) =>
+          !!el?.closest?.("header, nav, footer, .header, .nav, .footer, .menu, .navbar, .sidebar");
+        const selectors = [
+          ".video-item a[href]",
+          ".item a[href]",
+          ".grid-item a[href]",
+          ".search-item a[href]",
+          "a.title[href]",
+          "a.video-link[href]",
+          ".box a[href]",
+          "div.item a[href]",
+          'a[href*="/video/"]',
+          'a[href*="/v/"]',
+          'a[href*="/detail/"]',
+          'a[href*="/movie/"]',
+          'a[href*="/?v="]',
+          'a[href*="/video?id="]',
+        ];
+        for (const sel of selectors) {
+          for (const a of document.querySelectorAll(sel)) {
+            if (skipContainer(a)) continue;
+            const href = abs(a.getAttribute("href") || a.href);
+            if (!href || !sameOrigin(href)) continue;
+            if (bad.test(href)) continue;
+            return href;
+          }
+        }
+        const main = document.querySelector("main, #main, .main, #content, .content, .search-result, .results");
+        const scope = main || document.body;
+        let best = "";
+        let bestScore = 0;
+        for (const a of scope.querySelectorAll("a[href]")) {
+          if (skipContainer(a)) continue;
+          const href = abs(a.getAttribute("href") || a.href);
+          if (!href || !sameOrigin(href)) continue;
+          if (bad.test(href)) continue;
+          const text = (a.textContent || "").trim();
+          let score = 1;
+          if (text.length >= 3) score += 2;
+          if (/\/video|\/v\/|\/detail|\/movie/i.test(href)) score += 5;
+          if (score > bestScore) {
+            bestScore = score;
+            best = href;
+          }
+        }
+        return best;
+      },
+    });
+    return result || "";
+  } catch {
+    return "";
+  }
+}
+
+async function addTabToGroup(tabId, groupId) {
+  if (groupId == null || groupId === -1 || !tabId) return;
+  try {
+    await chrome.tabs.group({ tabIds: tabId, groupId });
+  } catch (e) {
+    await pushLog("warn", "無法加入群組", e.message || String(e));
+  }
+}
+
+async function runBatchSearchJob({ sourceTabId, queries, openFirstResult, delayMs }) {
+  batchSearchCancel = false;
+  batchSearchRunning = true;
+  let done = 0;
+  let failed = 0;
+
+  try {
+    const sourceTab = await chrome.tabs.get(sourceTabId);
+    if (!isWebTabUrl(sourceTab.url)) throw new Error("來源分頁不是有效網頁");
+    const groupId = sourceTab.groupId;
+    const searchConfig = await detectSiteSearchFromTab(sourceTabId);
+    const total = queries.length;
+
+    for (let i = 0; i < queries.length; i++) {
+      if (batchSearchCancel) break;
+      const query = queries[i];
+      const index = i + 1;
+      broadcastBatchProgress({ index, total, query, status: "running" });
+
+      const searchUrl = VDM.buildSearchUrl(searchConfig, query);
+      if (!searchUrl) {
+        failed++;
+        broadcastBatchProgress({ index, total, query, status: "error", note: "無法建立搜索 URL" });
+        continue;
+      }
+
+      try {
+        if (openFirstResult) {
+          const searchTab = await chrome.tabs.create({ url: searchUrl, active: false });
+          await waitTabComplete(searchTab.id);
+          const resultUrl = await pickFirstResultFromTab(searchTab.id);
+          try {
+            await chrome.tabs.remove(searchTab.id);
+          } catch {
+            /* ignore */
+          }
+          const finalUrl = resultUrl || searchUrl;
+          const resultTab = await chrome.tabs.create({ url: finalUrl, active: false });
+          await addTabToGroup(resultTab.id, groupId);
+          done++;
+          broadcastBatchProgress({
+            index,
+            total,
+            query,
+            status: resultUrl ? "done" : "skipped",
+            url: finalUrl,
+            note: resultUrl ? "" : "未找到首筆結果，已開搜索頁",
+          });
+        } else {
+          const tab = await chrome.tabs.create({ url: searchUrl, active: false });
+          await addTabToGroup(tab.id, groupId);
+          done++;
+          broadcastBatchProgress({ index, total, query, status: "done", url: searchUrl });
+        }
+      } catch (e) {
+        failed++;
+        const note = e.message === "cancelled" ? "已取消" : e.message || "失敗";
+        broadcastBatchProgress({ index, total, query, status: "error", note });
+        if (e.message === "cancelled") break;
+      }
+
+      if (delayMs > 0 && i < queries.length - 1 && !batchSearchCancel) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+
+    if (batchSearchCancel) {
+      broadcastBatchProgress({ status: "cancelled" });
+      await pushLog("info", `批量搜索已停止（${done}/${total}）`);
+    } else {
+      const summary = `完成 ${done}/${total}${failed ? `，失敗 ${failed}` : ""}`;
+      broadcastBatchProgress({ status: "finished", summary, done, failed, total });
+      await pushLog("info", `批量搜索：${summary}`);
+    }
+  } finally {
+    batchSearchRunning = false;
+    batchSearchCancel = false;
+  }
+}
+
 async function applyUiMode() {
   if (!chrome.action?.setPopup) return;
   try {
@@ -182,6 +508,14 @@ const initPromise = (async function init() {
     console.error("VDM restore failed", e);
   }
 })();
+
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === "install" || details.reason === "update") {
+    pushLog("info", `VDM 擴充已${details.reason === "install" ? "安裝" : "更新"} v${chrome.runtime.getManifest().version}`).catch(
+      () => {}
+    );
+  }
+});
 
 chrome.action.onClicked.addListener(async (tab) => {
   await loadSettings();
@@ -1456,6 +1790,39 @@ async function handleMessage(msg, sender) {
     case "OPEN_MANAGER_TAB": {
       const resolved = await resolveTargetTabId(msg.tabId);
       return openManagerTab(resolved.tabId || lastWebTabId);
+    }
+    case "OPEN_BATCH_SEARCH": {
+      const resolved = await resolveTargetTabId(msg.tabId ?? msg.sourceTabId);
+      return openBatchSearchTab(resolved.tabId || lastWebTabId);
+    }
+    case "DETECT_SITE_SEARCH": {
+      const tid = msg.sourceTabId ?? (await resolveTargetTabId(msg.tabId)).tabId;
+      if (!tid) return { error: "找不到來源分頁" };
+      const config = await detectSiteSearchFromTab(tid);
+      const sampleUrl = VDM.buildSearchUrl(config, "SAMPLE-001");
+      return { config, sampleUrl };
+    }
+    case "START_BATCH_SEARCH": {
+      if (batchSearchRunning) return { error: "批量搜索進行中" };
+      const tid = msg.sourceTabId ?? (await resolveTargetTabId(msg.tabId)).tabId;
+      if (!tid) return { error: "找不到來源分頁" };
+      const queries = Array.isArray(msg.queries) ? msg.queries.filter(Boolean) : [];
+      if (!queries.length) return { error: "列表為空" };
+      runBatchSearchJob({
+        sourceTabId: tid,
+        queries,
+        openFirstResult: msg.openFirstResult !== false,
+        delayMs: Math.max(0, Number(msg.delayMs) || 600),
+      }).catch(async (e) => {
+        await pushLog("error", "批量搜索失敗", e.message || String(e));
+        broadcastBatchProgress({ status: "finished", summary: e.message || "批量搜索失敗" });
+        batchSearchRunning = false;
+      });
+      return { ok: true, count: queries.length };
+    }
+    case "STOP_BATCH_SEARCH": {
+      batchSearchCancel = true;
+      return { ok: true };
     }
     case "SET_MANAGER_SOURCE": {
       if (msg.tabId) await setManagerSourceTab(msg.tabId);

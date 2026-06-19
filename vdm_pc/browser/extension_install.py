@@ -22,9 +22,13 @@ _KNOWN_EXT_LABELS = {
 _SYNC_FILES = (
     "manifest.json",
     "background/service_worker.js",
+    "lib/siteSearch.js",
+    "sidepanel/batch-search.html",
+    "sidepanel/batch-search.js",
     "sidepanel/panel-pc.js",
     "sidepanel/panel-pc.html",
     "sidepanel/panel.js",
+    "sidepanel/panel.css",
 )
 
 

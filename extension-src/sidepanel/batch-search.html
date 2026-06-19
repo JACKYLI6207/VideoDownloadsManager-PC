@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>批量搜索 — Video Downloads Manager</title>
+  <link rel="stylesheet" href="panel.css" />
+  <style>
+    body.batch-search-page {
+      width: 100%;
+      min-height: 100vh;
+      max-height: none;
+      overflow: auto;
+    }
+    .batch-shell {
+      max-width: 880px;
+      margin: 0 auto;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .batch-main {
+      flex: 1;
+      padding: 16px 20px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .source-card,
+    .list-card,
+    .progress-card {
+      background: #fff;
+      border: 1px solid #e3e7f2;
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .source-card h2,
+    .list-card h2,
+    .progress-card h2 {
+      font-size: 14px;
+      color: #333;
+      margin-bottom: 10px;
+    }
+    .source-url {
+      font-size: 12px;
+      color: #067eff;
+      word-break: break-all;
+      line-height: 1.5;
+    }
+    .source-meta {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #888;
+    }
+    .file-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .file-row input[type="file"] {
+      font-size: 12px;
+      max-width: 100%;
+    }
+    .list-textarea {
+      width: 100%;
+      min-height: 180px;
+      padding: 10px;
+      border: 1px solid #d8deec;
+      border-radius: 8px;
+      font-family: Consolas, "Segoe UI", monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      resize: vertical;
+      box-sizing: border-box;
+    }
+    .option-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      align-items: center;
+      font-size: 12px;
+      color: #555;
+      margin-top: 8px;
+    }
+    .option-row label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .option-row input[type="number"] {
+      width: 64px;
+      padding: 4px 6px;
+      border: 1px solid #d8deec;
+      border-radius: 6px;
+    }
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .action-row .btn {
+      padding: 10px 16px;
+      font-weight: 600;
+    }
+    .progress-log {
+      max-height: 260px;
+      overflow-y: auto;
+      font-size: 12px;
+      line-height: 1.55;
+      color: #444;
+    }
+    .progress-log .line {
+      padding: 4px 0;
+      border-bottom: 1px solid #f0f2f8;
+      word-break: break-all;
+    }
+    .progress-log .line.ok { color: #0558b8; }
+    .progress-log .line.warn { color: #a66b00; }
+    .progress-log .line.err { color: #a61b1b; }
+    .hint {
+      font-size: 11px;
+      color: #888;
+      line-height: 1.55;
+      margin-top: 6px;
+    }
+    .count-badge {
+      display: inline-block;
+      background: #eef5ff;
+      color: #067eff;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .manual-panel {
+      display: none;
+      background: #fff8e6;
+      border: 1px solid #f0d080;
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .manual-panel.active {
+      display: block;
+    }
+    .manual-panel h2 {
+      font-size: 14px;
+      color: #8a5a00;
+      margin-bottom: 8px;
+    }
+    .manual-panel .manual-status {
+      font-size: 12px;
+      color: #555;
+      line-height: 1.55;
+      margin-bottom: 10px;
+    }
+    .manual-panel .manual-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .manual-panel .btn.primary {
+      background: #e6a700;
+    }
+    .confirmed-format {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #0558b8;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body class="batch-search-page">
+  <div class="batch-shell">
+    <header class="app-header">
+      <h1>批量搜索</h1>
+      <button class="btn-popout" id="backToMain" type="button">返回主面板</button>
+    </header>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <main class="batch-main">
+      <section class="source-card">
+        <h2>搜索來源分頁</h2>
+        <div id="sourceUrl" class="source-url">載入中…</div>
+        <div id="sourceMeta" class="source-meta"></div>
+        <p class="hint">
+          請先在目標網站開啟分頁（可先在該站手動搜索一次，以便自動偵測搜索格式）。
+          若來源分頁在 Chrome 群組內，新開的分頁也會加入同一群組。
+        </p>
+        <button class="btn" id="refreshSource" type="button">重新偵測來源</button>
+        <button class="btn" id="testDetect" type="button">測試搜索格式</button>
+        <div id="confirmedFormat" class="confirmed-format" hidden></div>
+      </section>
+
+      <section id="manualSearchPanel" class="manual-panel">
+        <h2>請先手動搜索一次以確認格式</h2>
+        <p id="manualSearchStatus" class="manual-status">
+          請切換到來源分頁，在網站搜索框輸入任意關鍵字（建議用列表第一項）並搜索。
+          搜索完成後，點下方「確認搜索格式」；或系統偵測到搜索頁 URL 後會自動繼續。
+        </p>
+        <div class="manual-actions">
+          <button class="btn primary" id="focusSourceBtn" type="button">前往來源分頁</button>
+          <button class="btn primary" id="confirmManualBtn" type="button">確認搜索格式</button>
+          <button class="btn" id="cancelManualBtn" type="button">取消</button>
+        </div>
+      </section>
+
+      <section class="list-card">
+        <h2>TXT 名稱列表 <span id="listCount" class="count-badge">0 項</span></h2>
+        <div class="file-row">
+          <input type="file" id="txtFile" accept=".txt,text/plain" />
+          <button class="btn" id="clearList" type="button">清空</button>
+        </div>
+        <textarea id="listText" class="list-textarea" placeholder="每行一個名稱，例如：&#10;ABP-003&#10;ABP-015"></textarea>
+        <div class="option-row">
+          <label><input type="checkbox" id="openFirstResult" checked /> 開啟首筆搜索結果（否則只開搜索頁）</label>
+          <label><input type="checkbox" id="recalibrateEachRun" /> 每次執行前重新確認搜索格式</label>
+          <label>同時併行 <input type="number" id="concurrency" min="1" step="1" value="3" /> 個</label>
+        </div>
+        <p class="hint">併行數：同時開啟的分頁數。勾選「首筆結果」時，每項仍須等搜索頁載入後才能抓連結；設 1 即逐條串行。</p>
+        <div class="action-row">
+          <button class="btn primary" id="startBtn" type="button">開始批量搜索</button>
+          <button class="btn" id="stopBtn" type="button" disabled>停止</button>
+        </div>
+      </section>
+
+      <section class="progress-card">
+        <h2>執行進度</h2>
+        <div id="progressSummary" class="source-meta">尚未開始</div>
+        <div id="progressLog" class="progress-log"></div>
+      </section>
+    </main>
+  </div>
+  <script src="../lib/siteSearch.js"></script>
+  <script src="batch-search.js"></script>
+</body>
+</html>
