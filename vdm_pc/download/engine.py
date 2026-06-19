@@ -56,7 +56,7 @@ class DownloadEngine(QObject):
     def _global_limit(self) -> int:
         tasks = max(1, int(self.settings.get("maxConcurrentTasks") or 2))
         conn = max(1, int(self.settings.get("maxConnections") or 3))
-        return min(108, tasks * conn)
+        return tasks * conn
     def _worker_limit(self) -> int:
         return max(1, int(self.settings.get("maxConnections") or 3))
     def _max_concurrent_tasks(self) -> int:
@@ -384,8 +384,8 @@ class DownloadEngine(QObject):
     def _make_client(self, workers: int = 1) -> httpx.Client:
         pool = max(workers, self._worker_limit())
         limits = httpx.Limits(
-            max_connections=min(108, pool),
-            max_keepalive_connections=min(108, pool),
+            max_connections=pool,
+            max_keepalive_connections=pool,
         )
         return httpx.Client(timeout=120, follow_redirects=True, limits=limits)
     def _fetch_text(self, client: httpx.Client, url: str, headers: dict[str, str]) -> str:

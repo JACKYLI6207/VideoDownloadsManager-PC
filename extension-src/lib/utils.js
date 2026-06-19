@@ -8,15 +8,15 @@ VDM.maxConcurrentTasks = 2;
 VDM.getWorkerCount = (total) =>
   Math.max(1, Math.min(VDM.maxConnections || 3, total || 1));
 
-VDM.clampConnections = (n) => Math.max(1, Math.min(18, Number(n) || 3));
+VDM.clampConnections = (n) => Math.max(1, Number(n) || 3);
 
-VDM.clampConcurrentTasks = (n) => Math.max(1, Math.min(6, Number(n) || 2));
+VDM.clampConcurrentTasks = (n) => Math.max(1, Number(n) || 2);
 
-/** 全局 HLS/HTTP 片段並行上限（任務數 × 單任務連線，硬上限 108 = 6×18） */
+/** 全局 HLS/HTTP 片段並行上限（任務數 × 單任務連線，依設定值計算） */
 VDM.getGlobalSegmentLimit = () => {
   const tasks = VDM.clampConcurrentTasks(VDM.maxConcurrentTasks);
   const conn = VDM.clampConnections(VDM.maxConnections);
-  return Math.min(108, Math.max(1, tasks * conn));
+  return Math.max(1, tasks * conn);
 };
 
 VDM._segmentSlots = { inUse: 0, waiters: [] };
