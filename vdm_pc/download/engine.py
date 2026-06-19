@@ -422,7 +422,12 @@ class DownloadEngine(QObject):
         video = task.video
         headers = self._build_headers(video, video.url)
         cache = cache_root(self.settings)
-        out = build_output_path(self.settings, task.file_name)
+        if task.download_folder:
+            from pathlib import Path as _P
+            out = _P(task.download_folder) / task.file_name
+            out.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            out = build_output_path(self.settings, task.file_name)
         workers = self._worker_limit()
         with self._make_client(workers) as client:
             playlist = m3u8_lib.parse_m3u8(self._fetch_text(client, video.url, headers), video.url)
@@ -507,7 +512,11 @@ class DownloadEngine(QObject):
             raise RuntimeError("cancelled")
         video = task.video
         headers = self._build_headers(video, video.url)
-        out = build_output_path(self.settings, task.file_name)
+        if task.download_folder:
+            from pathlib import Path as _P
+            out = _P(task.download_folder) / task.file_name
+        else:
+            out = build_output_path(self.settings, task.file_name)
         out.parent.mkdir(parents=True, exist_ok=True)
         with self._make_client() as client:
             res = client.head(video.url, headers=headers)

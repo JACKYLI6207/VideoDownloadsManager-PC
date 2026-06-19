@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from vdm_pc.config import download_root
 from vdm_pc.download.engine import DownloadEngine
 from vdm_pc.import_tasks import export_payload, import_tasks, parse_import_file
 from vdm_pc.models import DownloadTask
@@ -314,9 +315,30 @@ class ActivePanel(QWidget):
         payload = export_payload(self.engine.list_active())
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _ask_download_folder(self) -> str | None:
+        default = str(download_root(self.engine.settings))
+        box = QMessageBox(self)
+        box.setWindowTitle("選擇下載路徑")
+        box.setText("請選擇匯入任務的下載儲存路徑：")
+        box.setInformativeText(f"設定路徑：\n{default}")
+        use_default = box.addButton("使用設定路徑", QMessageBox.ButtonRole.AcceptRole)
+        choose_other = box.addButton("選擇其他路徑…", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is use_default:
+            return ""
+        if clicked is choose_other:
+            path = QFileDialog.getExistingDirectory(self, "選擇下載資料夾", default)
+            return path if path else None
+        return None
+
     def _import(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "導入任務", "", "JSON (*.json)")
         if not path:
+            return
+        folder = self._ask_download_folder()
+        if folder is None:
             return
         try:
             tasks, skipped = import_tasks(
@@ -324,6 +346,8 @@ class ActivePanel(QWidget):
                 {t.video.url for t in self.engine.list_active()},
             )
             for task in tasks:
+                if folder:
+                    task.download_folder = folder
                 self.engine.add_task(task)
             QMessageBox.information(
                 self,

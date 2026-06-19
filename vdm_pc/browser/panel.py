@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 
 from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.extension_loader import parse_extension_urls
-from vdm_pc.config import browser_profile_dir
+from vdm_pc.config import browser_profile_dir, download_root
 from vdm_pc.import_tasks import export_payload, import_tasks, normalize_url, parse_import_file
 from vdm_pc.models import DownloadTask, VideoMeta, format_resolution, resolve_quality
 
@@ -330,11 +330,35 @@ class BrowserPanel(QWidget):
                 return task
         return None
 
+    def _ask_download_folder(self) -> str | None:
+        default = str(download_root(self.settings))
+        box = QMessageBox(self)
+        box.setWindowTitle("選擇下載路徑")
+        box.setText("請選擇此次下載的儲存路徑：")
+        box.setInformativeText(f"設定路徑：\n{default}")
+        use_default = box.addButton("使用設定路徑", QMessageBox.ButtonRole.AcceptRole)
+        choose_other = box.addButton("選擇其他路徑…", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is use_default:
+            return ""
+        if clicked is choose_other:
+            path = QFileDialog.getExistingDirectory(self, "選擇下載資料夾", default)
+            return path if path else None
+        return None
+
     def _download_all(self) -> None:
         tasks = self._list_tasks()
         if not tasks:
             QMessageBox.information(self, "全部下載", "可下載清單為空。")
             return
+        folder = self._ask_download_folder()
+        if folder is None:
+            return
+        if folder:
+            for t in tasks:
+                t.download_folder = folder
         self._enqueue_tasks(tasks)
 
     def _download_one(self) -> None:
@@ -346,6 +370,11 @@ class BrowserPanel(QWidget):
         if not task:
             QMessageBox.warning(self, "下載", "無法讀取此項目，請重新從擴充加入。")
             return
+        folder = self._ask_download_folder()
+        if folder is None:
+            return
+        if folder:
+            task.download_folder = folder
         self._enqueue_tasks([task])
 
     def _enqueue_tasks(self, tasks: list[DownloadTask]) -> None:

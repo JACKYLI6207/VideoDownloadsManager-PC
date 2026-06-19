@@ -292,6 +292,53 @@ function buildDownloadPath(fileName, subfolder) {
   return sub ? `${sub}/${fileName}` : fileName;
 }
 
+async function resolveProductCodeFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return "";
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: () => {
+        // 番號格式：2-6 個大寫英文 + 連字號 + 3-6 位數字，例：NGOD-062、ABP-003
+        const pattern = /\b([A-Z]{2,6}-\d{3,6})\b/;
+        const candidates = [
+          () => {
+            const m = (location.pathname + " " + location.search).match(pattern);
+            return m ? m[1] : "";
+          },
+          () => {
+            for (const sel of ["h1", "h2", '[class*="number"]', '[class*="code"]', '[class*="title"]', '[class*="label"]']) {
+              for (const el of document.querySelectorAll(sel)) {
+                const m = el.textContent.match(pattern);
+                if (m) return m[1];
+              }
+            }
+            return "";
+          },
+          () => {
+            const m = document.title.match(pattern);
+            return m ? m[1] : "";
+          },
+          () => {
+            const meta = document.querySelector('meta[name="description"]')?.content || "";
+            const m = meta.match(pattern);
+            return m ? m[1] : "";
+          },
+        ];
+        for (const fn of candidates) {
+          try {
+            const code = fn();
+            if (code) return code;
+          } catch { /* ignore */ }
+        }
+        return "";
+      },
+    });
+    return result || "";
+  } catch {
+    return "";
+  }
+}
+
 async function resolvePosterInTab(tabId) {
   if (!tabId || !chrome.scripting?.executeScript) return "";
   try {
@@ -340,11 +387,11 @@ async function downloadCoverItems(items) {
   const subfolder = await getDownloadSubfolder();
   const used = new Set();
   let done = 0;
-  for (const { video, tabId, pageUrl, pageTitle } of items) {
+  for (const { video, tabId, pageUrl, pageTitle, productCode } of items) {
     let posterUrl = video?.posterUrl || "";
     if (!posterUrl && tabId) posterUrl = await resolvePosterInTab(tabId);
     if (!posterUrl) continue;
-    let saveName = buildSaveFilename(pageTitle, pageUrl);
+    let saveName = productCode || buildSaveFilename(pageTitle, pageUrl);
     if (used.has(saveName)) {
       let n = 2;
       while (used.has(`${saveName}_${n}`)) n++;
@@ -370,8 +417,9 @@ async function collectSelectedCoverItems(videoIds) {
       /* ignore */
     }
   }
+  const productCode = tabId ? await resolveProductCodeFromTab(tabId) : "";
   const list = (res.videos || videos).filter((v) => videoIds.includes(v.id));
-  return list.map((video) => ({ video, tabId, pageUrl, pageTitle }));
+  return list.map((video) => ({ video, tabId, pageUrl, pageTitle, productCode }));
 }
 
 async function collectGroupItemsFromTabs() {
@@ -386,11 +434,13 @@ async function collectGroupItemsFromTabs() {
     if (res.error) continue;
     const best = pickBestVideo(res.videos);
     if (!best) continue;
+    const productCode = await resolveProductCodeFromTab(tab.id);
     items.push({
       video: best,
       tabId: tab.id,
       pageUrl: res.pageUrl || tab.url,
       pageTitle: tab.title || "",
+      productCode,
     });
   }
   if (!items.length) throw new Error("群組內沒有偵測到可下載影片");

@@ -146,6 +146,7 @@ class DownloadTask:
     total: int = 0
     speed: float = 0.0
     error: str = ""
+    download_folder: str = ""
     started_at: float = field(default_factory=time.time)
 
     @classmethod
