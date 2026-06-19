@@ -162,6 +162,7 @@ class BrowserPanel(QWidget):
             ("清除", self._clear_one),
             ("導出", self._export_pending),
             ("導入", self._import_pending),
+            ("檔名列表匯出", self._export_filename_list),
         ):
             btn = QPushButton(label)
             btn.clicked.connect(slot)
@@ -394,6 +395,19 @@ class BrowserPanel(QWidget):
             return
         payload = export_payload(tasks)
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _export_filename_list(self) -> None:
+        tasks = self._list_tasks()
+        if not tasks:
+            QMessageBox.information(self, "檔名列表匯出", "可下載清單為空。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "匯出檔名列表", "檔名列表.txt", "TXT (*.txt)")
+        if not path:
+            return
+        names = [_copyable_name(t.file_name) for t in tasks]
+        Path(path).write_text("\n".join(names) + "\n", encoding="utf-8")
+        self._log(f"已匯出 {len(names)} 個檔名至：{path}")
+        QMessageBox.information(self, "匯出完成", f"已匯出 {len(names)} 個檔名至：\n{path}")
 
     def _import_pending(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "導入待下載任務", "", "JSON (*.json)")
