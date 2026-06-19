@@ -1,4 +1,5 @@
 self.VDM = self.VDM || {};
+{
 const VDM = self.VDM;
 
 VDM.SEARCH_FIELD_NAMES = [
@@ -306,3 +307,4 @@ VDM.pickFirstResultUrl = () => {
   }
   return best;
 };
+} // end block scope for VDM

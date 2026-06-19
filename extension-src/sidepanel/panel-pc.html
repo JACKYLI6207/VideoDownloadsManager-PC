@@ -10,10 +10,8 @@
   <div class="app-shell">
     <header class="app-header">
       <h1>⬇ Video Downloads Manager</h1>
-      <button class="btn-popout" id="openBatchSearch" type="button" title="開啟批量搜索分頁">批量搜索 ↗</button>
+      <button class="btn-popout" id="openBatchSearch" type="button" title="在新分頁開啟批量搜索（可選 TXT 列表）">批量搜索 ↗</button>
     </header>
-
-    <p class="batch-hint">批量搜索會在新分頁開啟，可在該頁選擇 TXT 並開始搜索。</p>
 
     <div id="toast" class="toast" hidden></div>
 
@@ -22,9 +20,14 @@
         <label><input type="checkbox" id="selectAll" /> 全選</label>
         <span id="detectedCount">0 個</span>
       </div>
+      <p id="sourceTabLabel" class="source-tab-label" hidden></p>
       <div id="detectedList" class="list"></div>
       <div id="detectedEmpty" class="empty" style="display:none">
-        尚未偵測到可下載影片。<br />請先播放影片，再開啟此面板。
+        <strong>尚未偵測到可下載影片</strong><br />
+        ① 切到正在<strong>播放影片</strong>的分頁<br />
+        ② 點下方「<strong>重新偵測</strong>」或按 F5<br />
+        ③ 播放影片後等 2 秒再看<br /><br />
+        <button class="btn primary" id="reinjectBtn" type="button" style="font-size:12px;padding:6px 14px;">↺ 重新偵測當前分頁</button>
       </div>
       <div class="footer" id="downloadFooter" style="display:none">
         <button class="btn primary" id="downloadBtn">添加至可下載清單</button>

@@ -11,6 +11,7 @@ from vdm_pc.log_bus import LogBus
 from vdm_pc.models import DownloadTask, VideoMeta
 from vdm_pc.ui.active_panel import ActivePanel
 from vdm_pc.ui.completed_panel import CompletedPanel
+from vdm_pc.ui.folder_panel import FolderPanel
 from vdm_pc.ui.log_panel import LogPanel
 from vdm_pc.ui.settings_panel import SettingsPanel
 from vdm_pc.ui.styles import APP_STYLESHEET
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(CompletedPanel(engine, settings), "已完成")
         tabs.addTab(LogPanel(log_bus), "日誌")
         tabs.addTab(SettingsPanel(settings, engine), "設定")
+        tabs.addTab(FolderPanel(), "資料夾")
         layout.addWidget(tabs, 1)
 
         log_bus.push("info", "VDM PC 已啟動")

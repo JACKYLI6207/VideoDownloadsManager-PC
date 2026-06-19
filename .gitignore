@@ -11,3 +11,6 @@ VideoDownloadsManagerPC.exe
 Video-Downloads-Manager-Windows.exe
 VideoDownloadsManagerPC.zip
 *.zip
+
+# IDE 設定（含本機路徑，不推送）
+.cursor/

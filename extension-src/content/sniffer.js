@@ -1,6 +1,7 @@
 (function () {
-  if (window.__vdmSniffer) return;
+  if (window.__vdmSniffer && !window.__vdmSnifferOrphaned) return;
   window.__vdmSniffer = true;
+  window.__vdmSnifferOrphaned = false;
 
   const VDM = self.VDM;
 

@@ -87,6 +87,28 @@ async function resolveTargetTabId(preferredTabId) {
   hit = await tryTab(active?.id);
   if (hit) return finalize(hit);
 
+  /* 批量搜索等會開啟擴充分頁；改找同視窗內已有偵測結果的分頁 */
+  const pickTabWithVideos = async (windowId) => {
+    const tabs =
+      windowId != null
+        ? await chrome.tabs.query({ windowId })
+        : await chrome.tabs.query({ currentWindow: true });
+    let best = null;
+    let bestCount = -1;
+    for (const t of tabs) {
+      if (!isWebTabUrl(t.url)) continue;
+      const count = store.countForTab(t.id);
+      if (count > bestCount) {
+        bestCount = count;
+        best = t;
+      }
+    }
+    return bestCount > 0 && best ? { tabId: best.id, pageUrl: best.url } : null;
+  };
+
+  hit = await pickTabWithVideos(focused?.windowId ?? active?.windowId);
+  if (hit) return finalize(hit);
+
   hit = await tryTab(lastWebTabId);
   if (hit) return finalize(hit);
 

@@ -283,9 +283,10 @@ header h1 {
 
 .empty {
   text-align: center;
-  color: #98a0b3;
-  padding: 48px 16px;
-  line-height: 1.6;
+  color: #555e7a;
+  font-size: 13px;
+  padding: 36px 16px;
+  line-height: 1.8;
 }
 
 .progress-block {
@@ -397,12 +398,12 @@ body.pc-mode .footer .btn.cover-dl {
   padding: 8px;
 }
 
-body.pc-mode .batch-hint {
-  margin: 0;
-  padding: 6px 14px 0;
+body.pc-mode .source-tab-label {
+  margin: -4px 0 8px;
   font-size: 11px;
-  color: #888;
-  line-height: 1.45;
+  color: #667;
+  line-height: 1.4;
+  word-break: break-all;
 }
 
 .log-list {

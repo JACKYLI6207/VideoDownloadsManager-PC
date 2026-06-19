@@ -63,6 +63,32 @@ function hideToast() {
   $("#toast").hidden = true;
 }
 
+function formatSourceLabel(pageUrl, tabId) {
+  if (!pageUrl) return tabId ? `分頁 #${tabId}` : "";
+  try {
+    const u = new URL(pageUrl);
+    const path = u.pathname && u.pathname !== "/" ? u.pathname : "";
+    const label = `${u.hostname}${path}`;
+    return label.length > 52 ? `${label.slice(0, 49)}…` : label;
+  } catch {
+    return pageUrl.length > 52 ? `${pageUrl.slice(0, 49)}…` : pageUrl;
+  }
+}
+
+function updateSourceTabLabel() {
+  const el = $("#sourceTabLabel");
+  if (!el) return;
+  const label = formatSourceLabel(currentPageUrl, currentTabId);
+  if (!label) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  el.textContent = `讀取分頁：${label}`;
+  el.title = currentPageUrl || label;
+}
+
 async function apiAllowError(type, payload = {}) {
   let res;
   try {
@@ -106,6 +132,7 @@ async function loadVideos() {
   await refreshContext();
   if (!currentTabId) {
     videos = [];
+    updateSourceTabLabel();
     renderDetected();
     scheduleUpdateGroupDownloadBtn();
     return;
@@ -116,6 +143,7 @@ async function loadVideos() {
   if (res.pageUrl) currentPageUrl = res.pageUrl;
   selected.clear();
   selectHighestQuality();
+  updateSourceTabLabel();
   renderDetected();
   scheduleUpdateGroupDownloadBtn();
 }
@@ -176,10 +204,10 @@ function renderDetected() {
     footer.style.display = "none";
     if (!currentTabId) {
       empty.innerHTML =
-        "無法連結影片分頁。<br />請先切到影片分頁再開啟此面板。";
+        "<strong>找不到影片分頁</strong><br />① 切到正在<strong>播放影片</strong>的分頁<br />② 按 <strong>F5</strong> 重新整理<br />③ 播放影片後再開此面板";
     } else {
       empty.innerHTML =
-        "尚未偵測到可下載影片。<br />請先播放影片；若剛更新擴充，請重新整理影片分頁後再試。";
+        "<strong>此分頁尚未偵測到影片</strong><br />① 切到正在<strong>播放影片</strong>的分頁<br />② 按 <strong>F5</strong> 重新整理<br />③ 播放影片後再開此面板";
     }
     return;
   }
@@ -387,7 +415,7 @@ async function withButton(btn, busyText, run) {
   }
 }
 
-$("#downloadBtn").addEventListener("click", async (e) => {
+$("#downloadBtn")?.addEventListener("click", async (e) => {
   e.preventDefault();
   const ids = [...selected];
   if (!ids.length) return;
@@ -480,10 +508,70 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
+async function reinjectSniffer() {
+  const btn = $("#reinjectBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "偵測中…"; }
+  try {
+    await refreshContext();
+    if (!currentTabId) {
+      showToast("找不到目標分頁，請先切到影片分頁再試", "error");
+      return;
+    }
+    await chrome.scripting.executeScript({
+      target: { tabId: currentTabId, allFrames: true },
+      func: () => {
+        delete window.__vdmSniffer;
+        delete window.__vdmSnifferOrphaned;
+      },
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId: currentTabId, allFrames: true },
+      files: ["lib/utils.js", "lib/detector.js", "content/sniffer.js"],
+    });
+    await new Promise((r) => setTimeout(r, 600));
+    await loadVideos();
+    if (!videos.length) {
+      showToast("已重新注入偵測器，請播放影片後等 2 秒", "info");
+    }
+  } catch (e) {
+    showToast(e.message || "重新注入失敗", "error");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "↺ 重新偵測當前分頁"; }
+  }
+}
+
+document.addEventListener("click", (e) => {
+  if (e.target?.id === "reinjectBtn") reinjectSniffer();
+});
+
+let refreshTimer = null;
+
+function startAutoRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = setInterval(() => {
+    loadVideos().catch(() => {});
+  }, 2000);
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") startAutoRefresh();
+  else stopAutoRefresh();
+});
+
 (async function init() {
   try {
     await loadVideos();
   } catch (err) {
+    updateSourceTabLabel();
+    renderDetected();
     showToast(err.message || "載入失敗", "error");
   }
+  startAutoRefresh();
 })();
