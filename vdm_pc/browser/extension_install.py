@@ -19,24 +19,6 @@ _KNOWN_EXT_LABELS = {
     "lnemmogegmgllangfmlpclaomcknfnbp": "Hide Images",
 }
 
-_SYNC_FILES = (
-    "manifest.json",
-    "background/service_worker.js",
-    "lib/utils.js",
-    "lib/detector.js",
-    "lib/m3u8.js",
-    "lib/videoStore.js",
-    "lib/pcBridge.js",
-    "lib/siteSearch.js",
-    "content/sniffer.js",
-    "sidepanel/batch-search.html",
-    "sidepanel/batch-search.js",
-    "sidepanel/panel-pc.js",
-    "sidepanel/panel-pc.html",
-    "sidepanel/panel.js",
-    "sidepanel/panel.css",
-)
-
 
 def extension_label_from_id(ext_id: str) -> str:
     return _KNOWN_EXT_LABELS.get(ext_id, ext_id)
@@ -48,12 +30,15 @@ def _extension_version(path: Path) -> str:
 
 
 def _extension_sync_key(path: Path) -> str:
+    """Hash entire extension tree so UI files (panel.html, panel-mode.js) trigger profile refresh."""
     h = hashlib.sha256()
-    for rel in _SYNC_FILES:
-        fp = path / rel
-        if fp.is_file():
-            h.update(rel.encode())
-            h.update(fp.read_bytes())
+    skip_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico"}
+    for fp in sorted(p for p in path.rglob("*") if p.is_file()):
+        if fp.suffix.lower() in skip_suffixes:
+            continue
+        rel = fp.relative_to(path).as_posix()
+        h.update(rel.encode())
+        h.update(fp.read_bytes())
     return h.hexdigest()
 
 

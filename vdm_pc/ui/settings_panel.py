@@ -4,13 +4,10 @@ from __future__ import annotations
 import os
 import subprocess
 
-from PyQt6.QtGui import QIntValidator
 from PyQt6.QtWidgets import (
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -18,8 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from vdm_pc.browser.extension_loader import extensions_root, parse_extension_urls, sync_extensions
-
-from vdm_pc.config import cache_root, download_root, save_settings
+from vdm_pc.config import save_settings
 
 
 class _ExtUrlsInput(QPlainTextEdit):
@@ -42,40 +38,6 @@ class SettingsPanel(QWidget):
         root = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.tasks_input = QLineEdit(str(settings["maxConcurrentTasks"]))
-        self.tasks_input.setValidator(QIntValidator(1, 9999, self))
-        self.tasks_input.setFixedWidth(72)
-        self.tasks_input.setPlaceholderText("1 以上整數")
-        self.tasks_input.editingFinished.connect(self._on_tasks)
-        form.addRow("同時最大下載任務數", self.tasks_input)
-
-        self.conn_input = QLineEdit(str(settings["maxConnections"]))
-        self.conn_input.setValidator(QIntValidator(1, 9999, self))
-        self.conn_input.setFixedWidth(72)
-        self.conn_input.setPlaceholderText("1 以上整數")
-        self.conn_input.editingFinished.connect(self._on_conn)
-        form.addRow("單任務最大連線數（HLS 片段並行）", self.conn_input)
-
-        folder_row = QHBoxLayout()
-        self.folder_label = QLabel(str(download_root(settings)))
-        pick_btn = QPushButton("選擇")
-        pick_btn.clicked.connect(self._pick_folder)
-        open_btn = QPushButton("開啟")
-        open_btn.clicked.connect(self._open_folder)
-        folder_row.addWidget(self.folder_label, 1)
-        folder_row.addWidget(pick_btn)
-        folder_row.addWidget(open_btn)
-        form.addRow("下載根目錄", folder_row)
-
-        self.subfolder_input = QLineEdit(settings.get("downloadSubfolder") or "")
-        self.subfolder_input.setPlaceholderText("例：MyVideos/2024（可選子資料夾）")
-        self.subfolder_input.editingFinished.connect(self._on_subfolder)
-        form.addRow("相對子路徑", self.subfolder_input)
-
-        self.cache_input = QLineEdit(settings.get("segmentCacheDir") or "vdm-cache")
-        self.cache_input.editingFinished.connect(self._on_cache)
-        form.addRow("片段暫存目錄名", self.cache_input)
-
         self.ext_urls_input = _ExtUrlsInput(self._on_ext_urls)
         self.ext_urls_input.setPlainText(settings.get("browserExtensionUrls") or "")
         self.ext_urls_input.setPlaceholderText(
@@ -97,45 +59,13 @@ class SettingsPanel(QWidget):
 
         root.addLayout(form)
         hint = QLabel(
-            f"片段暫存：{cache_root(settings)}\n"
             f"擴充檔案：{extensions_root()}\n"
-            "有擴充時會自動安裝至內建 Chrome；請點工具列圖示開啟面板。\n"
-            "任務數／連線數可自訂；全局片段並行＝任務數×連線數（無硬上限）。\n"
-            "HLS 合併使用內建 FFmpeg，輸出標準 MP4。"
+            "有擴充時會自動安裝至內建 Chrome；請點工具列圖示開啟面板。"
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         root.addWidget(hint)
         root.addStretch(1)
-
-    @staticmethod
-    def _parse_positive_int(text: str, fallback: int) -> int:
-        try:
-            return max(1, int(str(text).strip()))
-        except (TypeError, ValueError):
-            return fallback
-
-    def _on_tasks(self) -> None:
-        val = self._parse_positive_int(self.tasks_input.text(), int(self.settings.get("maxConcurrentTasks") or 2))
-        self.tasks_input.setText(str(val))
-        self.settings["maxConcurrentTasks"] = val
-        self.engine.update_settings(self.settings)
-        save_settings(self.settings)
-
-    def _on_conn(self) -> None:
-        val = self._parse_positive_int(self.conn_input.text(), int(self.settings.get("maxConnections") or 3))
-        self.conn_input.setText(str(val))
-        self.settings["maxConnections"] = val
-        self.engine.update_settings(self.settings)
-        save_settings(self.settings)
-
-    def _on_subfolder(self) -> None:
-        self.settings["downloadSubfolder"] = self.subfolder_input.text().strip()
-        save_settings(self.settings)
-
-    def _on_cache(self) -> None:
-        self.settings["segmentCacheDir"] = self.cache_input.text().strip() or "vdm-cache"
-        save_settings(self.settings)
 
     def _on_ext_urls(self) -> None:
         self.settings["browserExtensionUrls"] = self.ext_urls_input.toPlainText().strip()
@@ -151,20 +81,6 @@ class SettingsPanel(QWidget):
 
     def _open_extensions_dir(self) -> None:
         path = str(extensions_root())
-        if os.name == "nt":
-            os.startfile(path)  # noqa: S606
-        else:
-            subprocess.Popen(["xdg-open", path])  # noqa: S603,S607
-
-    def _pick_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "選擇下載資料夾", self.settings.get("downloadFolder", ""))
-        if path:
-            self.settings["downloadFolder"] = path
-            self.folder_label.setText(path)
-            save_settings(self.settings)
-
-    def _open_folder(self) -> None:
-        path = str(download_root(self.settings))
         if os.name == "nt":
             os.startfile(path)  # noqa: S606
         else:

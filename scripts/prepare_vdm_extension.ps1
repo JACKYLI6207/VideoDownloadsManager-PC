@@ -9,9 +9,8 @@ if (-not (Test-Path (Join-Path $SrcRoot "manifest-pc.json"))) {
     throw "extension-src not found: $SrcRoot"
 }
 
-$ExtParent = Join-Path $PcRoot "extension"
-if (Test-Path $ExtParent) {
-    Remove-Item -Recurse -Force $ExtParent
+if (Test-Path $Dest) {
+    Remove-Item -Recurse -Force $Dest
 }
 New-Item -ItemType Directory -Path $Dest -Force | Out-Null
 

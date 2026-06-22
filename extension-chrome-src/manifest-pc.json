@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Video Downloads Manager PC",
+  "version": "1.2.8",
+  "description": "VDM_PC",
+  "key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCuOKHISNcqJK/RxWou7ePbLg+jcO8TYKZ3mGOmW6iZSILUuPGk1jn0I21oW0yCAPBnJS0Gv/QkcehC+PxRS2pCUPBk+2pr5vMER+5vK2A4T+RaqJ0b6lYwFg3c3FO+4fIBfZA1C8JpbcW7xSuUciE98vqiHaTGRuVmyoICzQIDAQAB",
+  "default_locale": "zh_TW",
+  "permissions": [
+    "webRequest",
+    "downloads",
+    "offscreen",
+    "storage",
+    "tabs",
+    "tabGroups",
+    "alarms",
+    "cookies",
+    "scripting",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:18429/*"],
+  "background": {
+    "service_worker": "background/service_worker.js"
+  },
+  "action": {
+    "default_title": "Video Downloads Manager",
+    "default_popup": "sidepanel/panel-pc.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["lib/utils.js", "lib/detector.js", "content/sniffer.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

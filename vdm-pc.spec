@@ -15,22 +15,34 @@ _vdm_ext_datas = []
 if _ext_root.is_dir():
     import json as _json
 
-    def _try_add_vdm_ext(_path):
+    def _try_add_bundled_ext(_path, _marker, _dest_name):
         _manifest = _path / "manifest.json"
         if not _manifest.is_file():
             return False
         try:
             _data = _json.loads(_manifest.read_text(encoding="utf-8"))
-            if _data.get("description") == "VDM_PC":
-                _vdm_ext_datas.append((str(_path), "vdm-extension"))
+            if _data.get("description") == _marker:
+                _vdm_ext_datas.append((str(_path), _dest_name))
                 return True
         except (OSError, _json.JSONDecodeError):
             pass
         return False
 
-    if not _try_add_vdm_ext(_ext_root):
+    _bundled = [
+        ("VDM_Bundled", "vdm-extension"),
+        ("VDM_Chrome", "vdm-extension"),
+        ("VDM_PC", "vdm-extension"),
+    ]
+    _added: set[str] = set()
+    for _marker, _dest_name in _bundled:
+        if _dest_name in _added:
+            continue
+        if _try_add_bundled_ext(_ext_root, _marker, _dest_name):
+            _added.add(_dest_name)
+            continue
         for _child in sorted(_ext_root.iterdir()):
-            if _child.is_dir() and _try_add_vdm_ext(_child):
+            if _child.is_dir() and _try_add_bundled_ext(_child, _marker, _dest_name):
+                _added.add(_dest_name)
                 break
 
 _icon_datas = [(str(_icon), ".")] if _icon.is_file() else []
@@ -58,7 +70,6 @@ _hidden = [
     "vdm_pc.models",
     "vdm_pc.persist",
     "vdm_pc.ui.active_panel",
-    "vdm_pc.ui.completed_panel",
     "vdm_pc.ui.log_panel",
     "vdm_pc.ui.settings_panel",
     "vdm_pc.ui.styles",

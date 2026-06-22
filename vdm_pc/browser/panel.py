@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 
 from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.extension_loader import parse_extension_urls
-from vdm_pc.config import browser_profile_dir, download_root
+from vdm_pc.config import browser_profile_dir
 from vdm_pc.import_tasks import export_payload, import_tasks, normalize_url, parse_import_file
 from vdm_pc.models import DownloadTask, VideoMeta, format_resolution, resolve_quality
 
@@ -94,7 +94,6 @@ def _task_from_snap(snap: dict) -> DownloadTask | None:
 class BrowserPanel(QWidget):
     _LIST_ROW_HEIGHT = 42
 
-    add_download = pyqtSignal(object)
     tasks_received = pyqtSignal(list)
 
     def __init__(self, settings: dict, parent=None) -> None:
@@ -156,8 +155,6 @@ class BrowserPanel(QWidget):
         left_layout.addWidget(self.resource_table, 1)
         btn_row = QHBoxLayout()
         for label, slot in (
-            ("全部下載", self._download_all),
-            ("下載", self._download_one),
             ("全部清除", self._clear_all),
             ("清除", self._clear_one),
             ("導出", self._export_pending),
@@ -226,7 +223,7 @@ class BrowserPanel(QWidget):
 
     def _on_ready(self) -> None:
         self.status_label.setText("瀏覽器就緒")
-        self._log("✅ 瀏覽器已就緒，任務會出現於「可下載清單」")
+        self._log("✅ 瀏覽器已就緒，擴充嗅探結果會出現於「可下載清單」")
 
     def _on_closed(self) -> None:
         self.start_btn.setEnabled(True)
@@ -321,77 +318,15 @@ class BrowserPanel(QWidget):
         return None
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
-        self.resource_table.selectRow(row)
-        self._download_one()
+        task = self._resolve_row_task(row)
+        if task:
+            self._copy_video_name(_copyable_name(task.file_name))
 
     def _find_task(self, task_id: str) -> DownloadTask | None:
         for task in self.pending:
             if task.id == task_id:
                 return task
         return None
-
-    def _ask_download_folder(self) -> str | None:
-        default = str(download_root(self.settings))
-        box = QMessageBox(self)
-        box.setWindowTitle("選擇下載路徑")
-        box.setText("請選擇此次下載的儲存路徑：")
-        box.setInformativeText(f"設定路徑：\n{default}")
-        use_default = box.addButton("使用設定路徑", QMessageBox.ButtonRole.AcceptRole)
-        choose_other = box.addButton("選擇其他路徑…", QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is use_default:
-            return ""
-        if clicked is choose_other:
-            path = QFileDialog.getExistingDirectory(self, "選擇下載資料夾", default)
-            return path if path else None
-        return None
-
-    def _download_all(self) -> None:
-        tasks = self._list_tasks()
-        if not tasks:
-            QMessageBox.information(self, "全部下載", "可下載清單為空。")
-            return
-        folder = self._ask_download_folder()
-        if folder is None:
-            return
-        if folder:
-            for t in tasks:
-                t.download_folder = folder
-        self._enqueue_tasks(tasks)
-
-    def _download_one(self) -> None:
-        row = self._selected_row()
-        if row < 0:
-            QMessageBox.information(self, "下載", "請先點選清單中的一筆影片。")
-            return
-        task = self._resolve_row_task(row)
-        if not task:
-            QMessageBox.warning(self, "下載", "無法讀取此項目，請重新從擴充加入。")
-            return
-        folder = self._ask_download_folder()
-        if folder is None:
-            return
-        if folder:
-            task.download_folder = folder
-        self._enqueue_tasks([task])
-
-    def _enqueue_tasks(self, tasks: list[DownloadTask]) -> None:
-        if not tasks:
-            return
-        added_ids: set[str] = set()
-        for task in tasks:
-            self.add_download.emit(task)
-            added_ids.add(task.id)
-
-        for row in range(self.resource_table.rowCount() - 1, -1, -1):
-            task = self._resolve_row_task(row)
-            if task and task.id in added_ids:
-                self.resource_table.removeRow(row)
-
-        self._rebuild_pending()
-        self._log(f"已加入下載 {len(added_ids)} 個任務（請看「進行中」）")
 
     def _clear_all(self) -> None:
         if not self._list_tasks():

@@ -147,6 +147,7 @@ class DownloadTask:
     speed: float = 0.0
     error: str = ""
     download_folder: str = ""
+    source_folder: str = ""
     started_at: float = field(default_factory=time.time)
 
     @classmethod
@@ -169,6 +170,8 @@ class DownloadTask:
             "downloaded": self.downloaded,
             "total": self.total,
             "error": self.error,
+            "downloadFolder": self.download_folder,
+            "sourceFolder": self.source_folder,
             "startedAt": int(self.started_at * 1000),
         }
 

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Downloads Manager</title>
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body class="pc-mode">
+  <div class="app-shell">
+    <header class="app-header">
+      <h1>⬇ Video Downloads Manager</h1>
+    </header>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <section id="panel-detected" class="panel active">
+      <div class="toolbar">
+        <label><input type="checkbox" id="selectAll" /> 全選</label>
+        <span id="detectedCount">0 個</span>
+      </div>
+      <div id="detectedList" class="list"></div>
+      <div id="detectedEmpty" class="empty" style="display:none">
+        尚未偵測到可下載影片。<br />請先播放影片，再開啟此面板。
+      </div>
+      <div class="footer" id="downloadFooter" style="display:none">
+        <button class="btn primary" id="downloadBtn">添加至可下載清單</button>
+        <button class="btn group-dl" id="groupDownloadBtn" hidden>群組添加至可下載清單</button>
+        <button class="btn cover-dl" id="coverDownloadBtn">下載封面</button>
+        <button class="btn cover-dl" id="groupCoverDownloadBtn" hidden>群組下載封面</button>
+      </div>
+    </section>
+  </div>
+  <script src="panel-pc.js"></script>
+</body>
+</html>

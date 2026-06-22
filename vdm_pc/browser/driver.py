@@ -23,7 +23,7 @@ from vdm_pc.browser.extension_loader import (
     parse_extension_urls,
     sync_extensions,
 )
-from vdm_pc.extension_bundle import bundled_vdm_extension_dir
+from vdm_pc.extension_bundle import bundled_extension_dirs
 
 
 class PlaywrightDriver(QThread):
@@ -111,28 +111,28 @@ class PlaywrightDriver(QThread):
             def log(msg: str) -> None:
                 self.status_message.emit(msg)
 
-            vdm_path = bundled_vdm_extension_dir()
-            if not vdm_path:
-                self.error_occurred.emit("找不到內建 VDM 擴充，請重新建置 EXE")
+            bundled_paths = bundled_extension_dirs()
+            if not bundled_paths:
+                self.error_occurred.emit("找不到內建擴充，請重新建置 EXE")
                 return
 
             user_paths = sync_extensions(self.extension_urls, log=log) if self.extension_urls else []
-            ext_paths = [vdm_path] + user_paths
+            ext_paths = bundled_paths + user_paths
 
             prepare_profile_extensions(ext_paths, self.profile_dir, log=log)
 
             chrome_exe = resolve_chrome_exe(log=log)
             port = self._pick_free_port()
             self._cdp_port = port
-            log("啟動 Google Chrome（含 VDM 擴充）…")
+            log(f"啟動 Google Chrome（含 {len(bundled_paths)} 個內建擴充）…")
             self._chrome_proc = self._launch_chrome(port, chrome_exe)
             self._wait_cdp_port(port)
             debugger = f"localhost:{port}"
 
             try:
-                bidi_install_extensions(debugger, [vdm_path], log=log)
+                bidi_install_extensions(debugger, bundled_paths, log=log)
             except Exception as exc:  # noqa: BLE001
-                self.error_occurred.emit(f"VDM 擴充安裝失敗：{exc}")
+                self.error_occurred.emit(f"內建擴充安裝失敗：{exc}")
                 raise
 
             if user_paths:

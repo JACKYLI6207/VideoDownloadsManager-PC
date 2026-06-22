@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Downloads Manager</title>
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <h1>⬇ Video Downloads Manager</h1>
+    </header>
+
+    <nav class="mode-tabs">
+      <button type="button" class="mode-tab active" data-mode="pc">PC 推送</button>
+      <button type="button" class="mode-tab" data-mode="download">擴充下載</button>
+    </nav>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <div id="mode-pc" class="mode-shell active">
+      <section class="panel active">
+        <div class="toolbar">
+          <label><input type="checkbox" id="pc-selectAll" /> 全選</label>
+          <span id="pc-detectedCount">0 個</span>
+          <button class="btn-popout" id="pc-openBatchSearch" type="button" title="在新分頁開啟批量搜索">批量搜索 ↗</button>
+        </div>
+        <p id="pc-sourceTabLabel" class="source-tab-label" hidden></p>
+        <div id="pc-detectedList" class="list"></div>
+        <div id="pc-detectedEmpty" class="empty" style="display:none">
+          <strong>尚未偵測到可下載影片</strong><br />
+          ① 切到正在<strong>播放影片</strong>的分頁<br />
+          ② 點下方「<strong>重新偵測</strong>」或按 F5<br />
+          ③ 播放影片後等 2 秒再看<br /><br />
+          <button class="btn primary" id="pc-reinjectBtn" type="button" style="font-size:12px;padding:6px 14px;">↺ 重新偵測當前分頁</button>
+        </div>
+        <div class="footer" id="pc-downloadFooter" style="display:none">
+          <button class="btn primary" id="pc-downloadBtn">添加至 PC 可下載清單</button>
+          <button class="btn group-dl" id="pc-groupDownloadBtn" hidden>群組添加至 PC 可下載清單</button>
+          <button class="btn cover-dl" id="pc-coverDownloadBtn">下載封面</button>
+          <button class="btn cover-dl" id="pc-groupCoverDownloadBtn" hidden>群組下載封面</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="mode-download" class="mode-shell">
+      <div class="download-mode-bar" id="downloadModeBar">
+        <button type="button" class="btn-popout" id="popoutBtn">在分頁中開啟</button>
+      </div>
+      <div id="tabModeBar" class="tab-mode-bar">
+        <span id="sourceTabLabel">監視分頁：—</span>
+        <button type="button" class="btn" id="linkRecentTab">改用最近分頁</button>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="detected">可下載</button>
+        <button class="tab" data-tab="active">進行中</button>
+        <button class="tab" data-tab="completed">已完成</button>
+        <button class="tab" data-tab="log">日誌</button>
+        <button class="tab" data-tab="settings">設定</button>
+      </nav>
+
+      <section id="panel-detected" class="panel active">
+        <div class="toolbar">
+          <label><input type="checkbox" id="selectAll" /> 全選</label>
+          <span id="detectedCount">0 個</span>
+        </div>
+        <div id="detectedList" class="list"></div>
+        <div id="detectedEmpty" class="empty" style="display:none">
+          尚未偵測到可下載影片。<br />請先播放影片，再開啟此面板。
+        </div>
+        <div class="footer" id="downloadFooter" style="display:none">
+          <button class="btn primary" id="downloadBtn">下載選取項目</button>
+          <button class="btn group-dl" id="groupDownloadBtn" hidden>群組全部下載</button>
+        </div>
+      </section>
+
+      <section id="panel-active" class="panel">
+        <div class="toolbar active-summary">
+          <span id="activeTaskCount">0 個任務</span>
+        </div>
+        <div class="toolbar active-toolbar" id="activeToolbar" hidden>
+          <div class="active-toolbar-left">
+            <label><input type="checkbox" id="selectAllTasks" /> 全選</label>
+            <span id="activeSelectedCount">0 個</span>
+          </div>
+          <div class="active-toolbar-right">
+            <button type="button" class="btn" id="exportTasksBtn">導出</button>
+            <label class="btn import-label" for="importTasksFile">導入</label>
+            <input type="file" id="importTasksFile" accept=".json,application/json" hidden />
+          </div>
+        </div>
+        <div class="active-bulk-bar" id="activeBulkBar" hidden>
+          <button type="button" class="btn" id="bulkPauseBtn">暫停</button>
+          <button type="button" class="btn" id="bulkResumeBtn">繼續</button>
+          <button type="button" class="btn" id="bulkRetryBtn">從頭下載</button>
+          <button type="button" class="btn" id="bulkCancelBtn">中斷</button>
+        </div>
+        <div id="activeList" class="list"></div>
+        <div id="activeEmpty" class="empty">尚無進行中的下載</div>
+      </section>
+
+      <section id="panel-completed" class="panel">
+        <div class="toolbar">
+          <span id="completedCount">0 個</span>
+          <button class="btn" id="clearCompletedBtn">清除</button>
+        </div>
+        <div id="completedList" class="list"></div>
+        <div id="completedEmpty" class="empty">尚無已完成下載</div>
+      </section>
+
+      <section id="panel-settings" class="panel">
+        <div class="setting-block setting-block-wide">
+          <label class="setting-check">
+            <input type="checkbox" id="openInTab" />
+            點擊擴充圖示時以分頁開啟（完整版面）
+          </label>
+          <p class="setting-hint">啟用後點擴充圖示會直接開分頁。也可在「擴充下載」分頁上方點「在分頁中開啟」。</p>
+          <button type="button" class="btn primary" id="openInTabNow">立即在分頁中開啟</button>
+        </div>
+        <div class="setting-block">
+          <label class="setting-label" for="maxConcurrentTasks">同時最大下載任務數</label>
+          <input type="number" id="maxConcurrentTasks" class="setting-input setting-input-num" min="1" value="2" step="1" />
+          <p class="setting-hint">最多幾個影片任務同時進行（其餘排隊）。設越高 RAM 需求越大。</p>
+        </div>
+        <div class="setting-block">
+          <label class="setting-label" for="maxConnections">單任務最大連線數（HLS 片段並行）</label>
+          <input type="number" id="maxConnections" class="setting-input setting-input-num" min="1" value="3" step="1" />
+          <p class="setting-hint">單任務 HLS 片段並行數。全局並行 ≈ 任務數 × 此值。設過高可能被限速或不穩。</p>
+        </div>
+        <div class="setting-block">
+          <label class="setting-label">片段存檔位置 <span class="badge badge-new">必設</span></label>
+          <div class="setting-input-row">
+            <span id="fsaDirName" class="setting-info">未設定</span>
+            <button type="button" class="btn primary" id="reauthFsaDir" hidden>重新授權</button>
+            <button type="button" class="btn primary" id="pickFsaDir">選擇資料夾</button>
+            <button type="button" class="btn" id="clearFsaDir" hidden>清除</button>
+          </div>
+          <label class="setting-label setting-label-sub" for="downloadSubfolder">子路徑（選填，在上方資料夾內再分一層）</label>
+          <div class="setting-input-row">
+            <input type="text" id="downloadSubfolder" class="setting-input" value="" placeholder="留空 = 直接存到選擇的資料夾" />
+          </div>
+          <p class="setting-hint" id="fsaPathPreview">完整路徑：尚未設定</p>
+          <p class="setting-hint" id="fsaReauthHint" hidden>
+            Chrome 重啟後會暫時收回資料夾寫入權限（安全機制）。路徑已記住，點「重新授權」即可，不必重新瀏覽選資料夾。
+          </p>
+          <p class="setting-hint">
+            HLS 只下載 .ts 片段，<strong>不合併 MP4</strong>。每個任務一個子資料夾 + <code>index.m3u8</code>，請用 ffmpeg 自行合併。
+          </p>
+          <div class="setting-input-row setting-row-gap">
+            <button type="button" class="btn" id="clearOpfsCache">清除 Chrome 內部暫存</button>
+            <span id="opfsCacheInfo" class="setting-info"></span>
+          </div>
+          <p class="setting-hint">舊版「合併模式」會把片段暫存在 C 槽 Chrome 設定目錄（OPFS），失敗任務可能殘留數十 GB。現版片段模式不再使用，可安全清除。</p>
+          <input type="checkbox" id="useDiskCache" checked hidden />
+        </div>
+        <div class="setting-block" hidden>
+          <label class="setting-label" for="segmentCacheDir">片段暫存目錄名稱</label>
+          <div class="setting-input-row">
+            <input type="text" id="segmentCacheDir" class="setting-input" value="vdm-cache" />
+            <button type="button" class="btn-folder" id="openCacheInfo" title="片段暫存說明">📁</button>
+          </div>
+          <p class="setting-hint">瀏覽器內部暫存區的資料夾名稱，合併成功或失敗後會清除該任務片段。</p>
+        </div>
+      </section>
+
+      <section id="panel-log" class="panel">
+        <div class="toolbar">
+          <span>錯誤 / 事件日誌</span>
+          <span class="hint-inline">（含非正常結束偵測）</span>
+          <button class="btn" id="copyLogBtn">複製</button>
+          <button class="btn" id="clearLogBtn">清除</button>
+        </div>
+        <div id="logList" class="log-list"></div>
+        <div id="logEmpty" class="empty">尚無日誌</div>
+      </section>
+    </div>
+  </div>
+
+  <div id="importSegmentModal" class="modal-overlay" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="importSegmentTitle">
+      <h2 id="importSegmentTitle" class="modal-title">導入下載任務</h2>
+      <p id="importSegmentSummary" class="modal-summary">本批共 0 個任務</p>
+      <p class="modal-label">片段儲存位置（僅作用於本批導入）</p>
+      <label class="modal-option">
+        <input type="radio" name="importSegmentPathMode" value="default" checked />
+        <span class="modal-option-body">
+          <strong>設定默認路徑</strong>
+          <span id="importDefaultPathPreview" class="modal-hint">使用設定中的子路徑</span>
+        </span>
+      </label>
+      <label class="modal-option">
+        <input type="radio" name="importSegmentPathMode" value="custom" />
+        <span class="modal-option-body">
+          <strong>指定儲存路徑</strong>
+          <span class="modal-hint">手填＝在「片段存檔資料夾」下的子路徑；要換磁碟請點「選擇資料夾」</span>
+          <div class="setting-input-row modal-input-row">
+            <input
+              type="text"
+              id="importCustomSubfolder"
+              class="setting-input modal-input"
+              placeholder="例：batch-2026 / 留空 = 根資料夾"
+              disabled
+            />
+            <button type="button" class="btn" id="importPickSubfolder" disabled>選擇資料夾</button>
+          </div>
+          <span id="importCustomPathPreview" class="modal-hint"></span>
+        </span>
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="importSegmentCancel">取消</button>
+        <button type="button" class="btn primary" id="importSegmentConfirm">確認導入</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="panel-mode.js"></script>
+  <script src="panel-pc.js"></script>
+  <script src="panel.js"></script>
+</body>
+</html>

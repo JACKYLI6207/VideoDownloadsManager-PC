@@ -16,6 +16,10 @@ DEFAULTS = {
     "segmentCacheDir": "vdm-cache",
     "browserProfileDir": "",
     "browserExtensionUrls": "",
+    "autoScanMergeEnabled": False,
+    "autoScanMergeIntervalSec": 60,
+    "deleteSegmentsAfterMerge": False,
+    "extensionSegmentRoot": "",
 }
 
 _CONFIG_PATH = Path.home() / "AppData" / "Roaming" / "VideoDownloadsManager-PC" / "settings.json"
@@ -51,6 +55,13 @@ def load_settings() -> dict:
             pass
     data["maxConcurrentTasks"] = max(1, int(data.get("maxConcurrentTasks") or 2))
     data["maxConnections"] = max(1, int(data.get("maxConnections") or 3))
+    if "autoScanMergeEnabled" not in data and data.pop("autoMergeExtensionDownloads", False):
+        data["autoScanMergeEnabled"] = True
+    data["autoScanMergeIntervalSec"] = max(
+        10, min(3600, int(data.get("autoScanMergeIntervalSec") or 60))
+    )
+    data["autoScanMergeEnabled"] = bool(data.get("autoScanMergeEnabled"))
+    data["deleteSegmentsAfterMerge"] = bool(data.get("deleteSegmentsAfterMerge"))
     if not data.get("downloadFolder"):
         data["downloadFolder"] = str(Path.home() / "Downloads" / "VideoDownloadsManager")
     return data

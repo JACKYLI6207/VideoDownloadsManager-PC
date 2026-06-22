@@ -10,6 +10,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from vdm_pc.config import build_output_path, cache_root
 from vdm_pc.download import disk_store, m3u8 as m3u8_lib
 from vdm_pc.log_bus import LogBus
+from vdm_pc.merge_local import collect_segments, merge_segments_to_mp4
 from vdm_pc.models import DownloadTask, VideoMeta
 from vdm_pc import persist
 _AUTO_RETRY_SEC = 10
@@ -101,6 +102,28 @@ class DownloadEngine(QObject):
         self.task_changed.emit(task.id)
         if auto_start:
             self.enqueue(task.id)
+
+    @staticmethod
+    def is_local_merge(task: DownloadTask) -> bool:
+        return bool(task.source_folder)
+
+    def add_local_merge(self, source_folder: str, output_dir: str, *, auto_start: bool = True) -> str:
+        folder = Path(source_folder).resolve()
+        segments = collect_segments(folder)
+        name = folder.name
+        if not name.lower().endswith(".mp4"):
+            from vdm_pc.models import sanitize_filename
+            name = sanitize_filename(name) + ".mp4"
+        video = VideoMeta(url=f"local://{folder}", title=folder.name, is_m3u8=True)
+        task = DownloadTask.create(video, name)
+        task.source_folder = str(folder)
+        task.download_folder = str(Path(output_dir).resolve())
+        task.total = len(segments)
+        self.add_task(task, auto_start=auto_start)
+        return task.id
+
+    def list_local_merge_active(self) -> list[DownloadTask]:
+        return [t for t in self.list_active() if self.is_local_merge(t)]
     def list_active(self) -> list[DownloadTask]:
         return [
             t
@@ -149,6 +172,17 @@ class DownloadEngine(QObject):
             return
         self._cancel_auto_retry(task_id)
         self._invalidate_workers(task_id)
+        if self.is_local_merge(task):
+            task.status = "pending"
+            task.progress = 0
+            task.merge_progress = 0
+            task.error = ""
+            self._paused.discard(task_id)
+            self._cancelled.discard(task_id)
+            self._wait_queue = [x for x in self._wait_queue if x != task_id]
+            self.enqueue(task_id)
+            self._emit(task_id, immediate=True)
+            return
         disk_store.clear_task(cache_root(self.settings), task.video.id)
         task.status = "pending"
         task.progress = 0
@@ -172,7 +206,8 @@ class DownloadEngine(QObject):
         self._wait_queue = [x for x in self._wait_queue if x != task_id]
         task = self.tasks.pop(task_id, None)
         if task:
-            disk_store.clear_task(cache_root(self.settings), task.video.id)
+            if not self.is_local_merge(task):
+                disk_store.clear_task(cache_root(self.settings), task.video.id)
             task.status = "cancelled"
             self._schedule_persist()
             self.task_changed.emit(task_id)
@@ -266,11 +301,13 @@ class DownloadEngine(QObject):
                 task = self.tasks.get(task_id)
                 if not task or not self._alive(task_id, my_gen) or task_id in self._paused:
                     return
-                task.status = "downloading"
+                task.status = "merging" if self.is_local_merge(task) else "downloading"
                 task.error = ""
                 self._emit(task_id, immediate=True)
                 try:
-                    if task.video.is_m3u8 or ".m3u8" in task.video.url.lower():
+                    if self.is_local_merge(task):
+                        self._merge_local_folder(task, my_gen)
+                    elif task.video.is_m3u8 or ".m3u8" in task.video.url.lower():
                         self._download_hls(task, my_gen)
                     else:
                         self._download_http(task, my_gen)
@@ -284,7 +321,11 @@ class DownloadEngine(QObject):
                         self.completed.insert(0, task)
                         self.tasks.pop(task_id, None)
                         self.task_completed.emit(task)
-                        self.log_bus.push("info", f"下載完成：{task.file_name}")
+                        if self.is_local_merge(task):
+                            self.log_bus.push("info", f"合併完成：{task.file_name}")
+                            self._maybe_delete_local_segments(task)
+                        else:
+                            self.log_bus.push("info", f"下載完成：{task.file_name}")
                         self._schedule_persist()
                 except FetchBlockedError as exc:
                     if task_id not in self._cancelled:
@@ -297,9 +338,10 @@ class DownloadEngine(QObject):
                     elif "cancelled" in str(exc).lower():
                         return
                     else:
-                        retry = not self._is_local_file_error(exc)
+                        retry = not self._is_local_file_error(exc) and not self.is_local_merge(task)
                         self._pause_on_error(task, str(exc), auto_retry=retry)
-                        self.log_bus.push("error", f"下載失敗：{task.file_name}", str(exc))
+                        label = "合併失敗" if self.is_local_merge(task) else "下載失敗"
+                        self.log_bus.push("error", f"{label}：{task.file_name}", str(exc))
                 finally:
                     self._emit(task_id, immediate=True)
             finally:
@@ -613,6 +655,53 @@ class DownloadEngine(QObject):
     def _merge_seg_pct(self, done: int, total: int) -> float:
         """片段合併進度（保留 94% 給 MP4 封裝階段）。"""
         return min(94.0, self._seg_pct(done, total))
+
+    def _merge_local_folder(self, task: DownloadTask, gen: int) -> None:
+        if not self._alive(task.id, gen):
+            raise RuntimeError("cancelled")
+        source = Path(task.source_folder)
+        if task.download_folder:
+            out = Path(task.download_folder) / task.file_name
+        else:
+            out = build_output_path(self.settings, task.file_name)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        segments = collect_segments(source)
+        task.total = len(segments)
+        task.status = "merging"
+        task.merge_progress = 0
+        task.progress = 0
+        self._emit(task.id, immediate=True)
+
+        def on_ffmpeg(pct: float) -> None:
+            if not self._alive(task.id, gen):
+                raise RuntimeError("cancelled")
+            task.merge_progress = pct
+            task.progress = pct
+            self._emit(task.id)
+
+        merge_segments_to_mp4(segments, out, on_progress=on_ffmpeg)
+        task.merge_progress = 100
+        task.progress = 100
+
+    def _maybe_delete_local_segments(self, task: DownloadTask) -> None:
+        if not self.settings.get("deleteSegmentsAfterMerge"):
+            return
+        source = Path(task.source_folder).resolve()
+        if not source.is_dir():
+            return
+        if task.download_folder:
+            out_mp4 = Path(task.download_folder).resolve() / task.file_name
+        else:
+            out_mp4 = build_output_path(self.settings, task.file_name)
+        if not (out_mp4.is_file() and out_mp4.stat().st_size > 0):
+            self.log_bus.push("warn", f"略過刪除片段（輸出 MP4 未就緒）：{source.name}")
+            return
+        try:
+            shutil.rmtree(source)
+            self.log_bus.push("info", f"已刪除片段資料夾：{source}")
+        except OSError as exc:
+            self.log_bus.push("warn", f"刪除片段資料夾失敗：{source.name}", str(exc))
+
     def _finalize_hls_mp4(self, task: DownloadTask, cache: Path, video_id: str, out: Path, gen: int) -> None:
         task.status = "merging"
         task.merge_progress = max(task.merge_progress, 94.0)

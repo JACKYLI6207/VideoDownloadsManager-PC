@@ -9,7 +9,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 & .\.venv\Scripts\pip install -r requirements.txt -q
 
-powershell -ExecutionPolicy Bypass -File "$Root\scripts\prepare_vdm_extension.ps1"
+powershell -ExecutionPolicy Bypass -File "$Root\scripts\prepare_extensions.ps1"
 
 Get-Process -Name "VideoDownloadsManagerPC" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item "$Root\_internal" -Recurse -Force -ErrorAction SilentlyContinue

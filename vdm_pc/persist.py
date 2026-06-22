@@ -57,6 +57,8 @@ def load_active() -> list[DownloadTask]:
             downloaded=int(snap.get("downloaded") or 0),
             total=int(snap.get("total") or 0),
             error="",
+            download_folder=str(snap.get("downloadFolder") or ""),
+            source_folder=str(snap.get("sourceFolder") or ""),
         )
         out.append(task)
     return out

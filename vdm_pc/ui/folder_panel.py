@@ -28,46 +28,61 @@ def _is_self_executable(file_path: str) -> bool:
     return os.path.normcase(file_path) == os.path.normcase(os.path.abspath(__file__))
 
 
-def _collect_files(folder: str, exclude_names: set[str] | None = None) -> tuple[list[str], list[str]]:
+def _collect_entries(folder: str, exclude_names: set[str] | None = None) -> tuple[list[tuple[str, str]], list[str]]:
+    """回傳 [(名稱, 'file'|'dir'), ...] 與錯誤訊息。"""
     exclude = exclude_names or set()
-    files: list[str] = []
+    entries: list[tuple[str, str]] = []
     errors: list[str] = []
     try:
-        entries = os.listdir(folder)
+        names = os.listdir(folder)
     except OSError as exc:
         return [], [f"無法讀取資料夾：{exc}"]
-    for entry in sorted(entries):
-        path = os.path.join(folder, entry)
+    for entry in sorted(names):
         if entry in exclude:
             continue
-        if not os.path.isfile(path):
-            continue
-        if _is_self_executable(path):
-            continue
-        files.append(entry)
-    return files, errors
+        path = os.path.join(folder, entry)
+        if os.path.isfile(path):
+            if _is_self_executable(path):
+                continue
+            entries.append((entry, "file"))
+        elif os.path.isdir(path):
+            entries.append((entry, "dir"))
+    return entries, errors
+
+
+def _collect_files(folder: str, exclude_names: set[str] | None = None) -> tuple[list[str], list[str]]:
+    entries, errors = _collect_entries(folder, exclude_names)
+    return [name for name, kind in entries if kind == "file"], errors
+
+
+def _new_entry_name(entry: str, kind: str, remove_text: str) -> str:
+    if kind == "file":
+        name, ext = os.path.splitext(entry)
+        return name.replace(remove_text, "") + ext
+    return entry.replace(remove_text, "")
 
 
 def _execute_rename(folder: str, remove_text: str) -> tuple[list[str], list[str]]:
     success: list[str] = []
     errors: list[str] = []
-    files, errs = _collect_files(folder)
+    entries, errs = _collect_entries(folder)
     errors.extend(errs)
-    for entry in files:
-        name, ext = os.path.splitext(entry)
-        new_name = name.replace(remove_text, "") + ext
+    # 先改檔名，再改子資料夾名稱
+    for entry, kind in sorted(entries, key=lambda x: (0 if x[1] == "file" else 1, x[0].lower())):
+        new_name = _new_entry_name(entry, kind, remove_text)
         if new_name == entry:
             continue
-        if not new_name or new_name == ext:
-            errors.append(f"略過（移除後檔名無效）：{entry}")
+        if not new_name or (kind == "file" and new_name == os.path.splitext(entry)[1]):
+            errors.append(f"略過（移除後名稱無效）：{entry}")
             continue
         new_path = os.path.join(folder, new_name)
         if os.path.exists(new_path):
             errors.append(f"略過（目標已存在）：{entry} → {new_name}")
             continue
+        label = "資料夾" if kind == "dir" else "檔案"
         try:
             os.rename(os.path.join(folder, entry), new_path)
-            success.append(f"{entry} → {new_name}")
+            success.append(f"{label} {entry} → {new_name}")
         except OSError as exc:
             errors.append(f"失敗：{entry} → {new_name}（{exc}）")
     return success, errors
@@ -121,7 +136,7 @@ class _RenameTab(QWidget):
         form.addRow("要從檔名中刪除的文字", self.remove_input)
         layout.addLayout(form)
 
-        hint = QLabel("僅對目標資料夾內的檔案進行重新命名，不含子資料夾。")
+        hint = QLabel("對目標資料夾內的檔案與子資料夾名稱進行重新命名（不含更深層目錄）。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -144,7 +159,7 @@ class _RenameTab(QWidget):
             return
         reply = QMessageBox.question(
             self, "確認執行",
-            f"將從「{folder}」內所有檔名中刪除：\n\n{remove_text}\n\n確定要執行嗎？",
+            f"將從「{folder}」內所有檔案與子資料夾名稱中刪除：\n\n{remove_text}\n\n確定要執行嗎？",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -155,16 +170,16 @@ class _RenameTab(QWidget):
             for line in success:
                 self.log.append_line(line)
         else:
-            self.log.append_line("【沒有檔案被重新命名】")
+            self.log.append_line("【沒有項目被重新命名】")
         if errors:
             self.log.append_line("")
             self.log.append_line("【略過或失敗】")
             for line in errors:
                 self.log.append_line(line)
         if success:
-            QMessageBox.information(self, "完成", f"已成功重新命名 {len(success)} 個檔案。")
+            QMessageBox.information(self, "完成", f"已成功重新命名 {len(success)} 個項目。")
         else:
-            QMessageBox.information(self, "完成", "沒有符合條件的檔案被重新命名。")
+            QMessageBox.information(self, "完成", "沒有符合條件的檔案或資料夾被重新命名。")
 
 
 class _ExportTab(QWidget):

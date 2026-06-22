@@ -1,0 +1,2336 @@
+importScripts(
+  "../lib/utils.js",
+  "../lib/detector.js",
+  "../lib/m3u8.js",
+  "../lib/videoStore.js",
+  "../lib/pcBridge.js",
+  "../lib/blobStore.js",
+  "../lib/opfsStore.js",
+  "../lib/fsa.js",
+  "../lib/downloadEngine.js",
+  "../lib/siteSearch.js"
+);
+
+// MV3：更新後讓新版 Service Worker 立即接管，避免舊 SW 卡在 waiting
+// 造成 panel（新）與背景（舊）版本錯位、指定資料夾失效。
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+const store = new VDM.VideoStore();
+const engine = new VDM.DownloadEngine();
+const tabTitles = new Map();
+const tabPosterBest = new Map();
+const m3u8Pending = new Set();
+const DOWNLOAD_HDR_RULE = 9001;
+
+async function loadSettings() {
+  const { vdmSettings = {} } = await chrome.storage.local.get("vdmSettings");
+  VDM.maxConnections = VDM.clampConnections(vdmSettings.maxConnections);
+  VDM.maxConcurrentTasks = VDM.clampConcurrentTasks(vdmSettings.maxConcurrentTasks);
+  VDM.useDiskCache = vdmSettings.useDiskCache !== false;
+  VDM.openInTab = !!vdmSettings.openInTab;
+  VDM.downloadSubfolder = VDM.normalizeOptionalSubPath(vdmSettings.downloadSubfolder ?? "");
+  VDM.segmentCacheDir = String(vdmSettings.segmentCacheDir ?? "vdm-cache").trim() || "vdm-cache";
+  VDM.segmentsOnly = vdmSettings.segmentsOnly !== false;
+}
+
+const MANAGER_PAGE = "sidepanel/panel.html";
+
+function shouldPushToPc(msg) {
+  return !!(msg?.pushToPc || VDM.isPcMode());
+}
+let lastWebTabId = null;
+
+function isWebTabUrl(url) {
+  return (
+    url &&
+    !url.startsWith("chrome://") &&
+    !url.startsWith("chrome-extension://") &&
+    !url.startsWith("edge://")
+  );
+}
+
+function managerTabUrl(sourceTabId, mode = "download") {
+  const params = new URLSearchParams({ view: "tab", mode });
+  if (sourceTabId) params.set("tabId", String(sourceTabId));
+  return `${chrome.runtime.getURL(MANAGER_PAGE)}?${params}`;
+}
+
+async function setManagerSourceTab(tabId) {
+  if (!tabId) return;
+  lastWebTabId = tabId;
+  await chrome.storage.session.set({ vdmManagerTabId: tabId });
+}
+
+async function resolveTargetTabId(preferredTabId) {
+  const tryTab = async (tid) => {
+    if (!tid || tid < 0) return null;
+    try {
+      const tab = await chrome.tabs.get(tid);
+      if (isWebTabUrl(tab.url)) return { tabId: tid, pageUrl: tab.url };
+    } catch {
+      /* tab closed */
+    }
+    return null;
+  };
+
+  const finalize = async (hit) => {
+    if (hit && hit.tabId !== lastWebTabId) {
+      await setManagerSourceTab(hit.tabId);
+    }
+    return hit;
+  };
+
+  let hit = await tryTab(preferredTabId);
+  if (hit) return finalize(hit);
+
+  /* 彈出視窗：優先使用者正在看的分頁，避免 session 指到群組內其他空白分頁 */
+  const [focused] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  hit = await tryTab(focused?.id);
+  if (hit) return finalize(hit);
+
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  hit = await tryTab(active?.id);
+  if (hit) return finalize(hit);
+
+  hit = await tryTab(lastWebTabId);
+  if (hit) return finalize(hit);
+
+  const { vdmManagerTabId } = await chrome.storage.session.get("vdmManagerTabId");
+  hit = await tryTab(vdmManagerTabId);
+  if (hit) return finalize(hit);
+
+  const windowTabs = await chrome.tabs.query({ currentWindow: true });
+  for (let i = windowTabs.length - 1; i >= 0; i--) {
+    hit = await tryTab(windowTabs[i].id);
+    if (hit) return finalize(hit);
+  }
+  return { tabId: null, pageUrl: "" };
+}
+
+async function openManagerTab(sourceTabId, mode = "download") {
+  const targetUrl = managerTabUrl(sourceTabId, mode);
+  const tab = await chrome.tabs.create({ url: targetUrl, active: true });
+  if (sourceTabId) await setManagerSourceTab(sourceTabId);
+  return { tabId: tab.id, ok: true };
+}
+
+const BATCH_SEARCH_PAGE = "sidepanel/batch-search.html";
+let batchSearchCancel = false;
+let batchSearchRunning = false;
+
+function batchSearchPageUrl(sourceTabId) {
+  const params = new URLSearchParams();
+  if (sourceTabId) params.set("sourceTabId", String(sourceTabId));
+  const qs = params.toString();
+  return `${chrome.runtime.getURL(BATCH_SEARCH_PAGE)}${qs ? `?${qs}` : ""}`;
+}
+
+async function openBatchSearchTab(sourceTabId) {
+  const targetUrl = batchSearchPageUrl(sourceTabId);
+  const base = chrome.runtime.getURL(BATCH_SEARCH_PAGE);
+  const tabs = await chrome.tabs.query({});
+  const existing = tabs.find((t) => t.url?.startsWith(base.split("?")[0]));
+  if (existing) {
+    await chrome.tabs.update(existing.id, { url: targetUrl, active: true });
+    return { tabId: existing.id, reused: true };
+  }
+  const tab = await chrome.tabs.create({ url: targetUrl, active: true });
+  return { tabId: tab.id, reused: false };
+}
+
+function broadcastBatchProgress(payload) {
+  broadcast({ type: "BATCH_SEARCH_PROGRESS", ...payload });
+}
+
+async function waitTabComplete(tabId, timeoutMs = 25000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (batchSearchCancel) throw new Error("cancelled");
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") return tab;
+    } catch {
+      throw new Error("分頁已關閉");
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error("載入逾時");
+}
+
+async function detectSiteSearchFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) {
+    throw new Error("無法在來源分頁執行偵測");
+  }
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    func: () => {
+      const fieldNames = [
+        "keyword",
+        "keywords",
+        "q",
+        "query",
+        "search",
+        "wd",
+        "k",
+        "search_query",
+        "text",
+        "s",
+      ];
+      const origin = location.origin;
+
+      try {
+        const current = new URL(location.href);
+        for (const key of fieldNames) {
+          const val = current.searchParams.get(key);
+          if (!val || val.length < 2) continue;
+          const encoded = encodeURIComponent(val);
+          let template = location.href;
+          if (template.includes(encoded)) template = template.split(encoded).join("{query}");
+          else template = template.split(val).join("{query}");
+          return { mode: "url", template, field: key, origin, source: "current-url" };
+        }
+      } catch {
+        /* ignore */
+      }
+
+      const inputSelectors = [
+        'input[type="search"]',
+        'input[name*="keyword" i]',
+        'input[name*="search" i]',
+        'input[id*="search" i]',
+        'input[placeholder*="搜" i]',
+        'input[placeholder*="search" i]',
+        'input[type="text"]',
+      ];
+      let searchInput = null;
+      for (const sel of inputSelectors) {
+        for (const inp of document.querySelectorAll(sel)) {
+          if (inp.type === "hidden" || inp.disabled) continue;
+          const hint = `${inp.name || ""} ${inp.id || ""} ${inp.placeholder || ""} ${inp.className || ""}`.toLowerCase();
+          if (fieldNames.some((n) => hint.includes(n)) || /search|搜|検索/.test(hint)) {
+            searchInput = inp;
+            break;
+          }
+        }
+        if (searchInput) break;
+      }
+      if (!searchInput) {
+        for (const form of document.querySelectorAll("form")) {
+          const hint = `${form.action || ""} ${form.id || ""} ${form.className || ""}`.toLowerCase();
+          if (!/search|搜|検索/.test(hint)) continue;
+          const inp = form.querySelector('input[type="search"], input[type="text"], input:not([type])');
+          if (inp && inp.type !== "hidden") {
+            searchInput = inp;
+            break;
+          }
+        }
+      }
+      if (searchInput) {
+        const form = searchInput.closest("form");
+        const fieldName =
+          searchInput.name ||
+          searchInput.id ||
+          (fieldNames.find((n) => (searchInput.name || searchInput.id || "").toLowerCase().includes(n)) ?? "keyword");
+        if (form?.action) {
+          try {
+            const action = new URL(form.action, location.href);
+            const method = (form.method || "get").toLowerCase();
+            if (method === "get") {
+              const params = new URLSearchParams(action.search);
+              for (const el of form.querySelectorAll("input, select, textarea")) {
+                if (!el.name || el === searchInput) continue;
+                if (el.type === "submit" || el.type === "button" || el.type === "hidden") continue;
+                if (el.value) params.set(el.name, el.value);
+              }
+              params.set(fieldName, "{query}");
+              const qs = params.toString();
+              const template = `${action.origin}${action.pathname}${qs ? `?${qs}` : ""}`;
+              return { mode: "url", template, field: fieldName, origin: action.origin, source: "form" };
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        return {
+          mode: "url",
+          template: `${origin}/search?${fieldName}={query}`,
+          field: fieldName,
+          origin,
+          source: "input-guess",
+          fallback: true,
+        };
+      }
+      return {
+        mode: "url",
+        template: `${origin}/search?keyword={query}`,
+        field: "keyword",
+        origin,
+        source: "default-guess",
+        fallback: true,
+      };
+    },
+  });
+  if (!result?.template) throw new Error("無法偵測網站搜索格式");
+  return result;
+}
+
+async function pickFirstResultFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return "";
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: () => {
+        const bad =
+          /\/search(?:\/|\?|$)|\/login|\/register|\/signup|\/tags?(?:\/|\?|$)|\/categories?(?:\/|\?|$)|\/actress|\/actor|\/genre|\/ranking|\/contact|\/about|\/help|#$|javascript:/i;
+        const abs = (u) => {
+          try {
+            return new URL(u, location.href).href;
+          } catch {
+            return "";
+          }
+        };
+        const sameOrigin = (u) => {
+          try {
+            return new URL(u).origin === location.origin;
+          } catch {
+            return false;
+          }
+        };
+        const skipContainer = (el) =>
+          !!el?.closest?.("header, nav, footer, .header, .nav, .footer, .menu, .navbar, .sidebar");
+        const selectors = [
+          ".video-item a[href]",
+          ".item a[href]",
+          ".grid-item a[href]",
+          ".search-item a[href]",
+          "a.title[href]",
+          "a.video-link[href]",
+          ".box a[href]",
+          "div.item a[href]",
+          'a[href*="/video/"]',
+          'a[href*="/v/"]',
+          'a[href*="/detail/"]',
+          'a[href*="/movie/"]',
+          'a[href*="/?v="]',
+          'a[href*="/video?id="]',
+        ];
+        for (const sel of selectors) {
+          for (const a of document.querySelectorAll(sel)) {
+            if (skipContainer(a)) continue;
+            const href = abs(a.getAttribute("href") || a.href);
+            if (!href || !sameOrigin(href)) continue;
+            if (bad.test(href)) continue;
+            return href;
+          }
+        }
+        const main = document.querySelector("main, #main, .main, #content, .content, .search-result, .results");
+        const scope = main || document.body;
+        let best = "";
+        let bestScore = 0;
+        for (const a of scope.querySelectorAll("a[href]")) {
+          if (skipContainer(a)) continue;
+          const href = abs(a.getAttribute("href") || a.href);
+          if (!href || !sameOrigin(href)) continue;
+          if (bad.test(href)) continue;
+          const text = (a.textContent || "").trim();
+          let score = 1;
+          if (text.length >= 3) score += 2;
+          if (/\/video|\/v\/|\/detail|\/movie/i.test(href)) score += 5;
+          if (score > bestScore) {
+            bestScore = score;
+            best = href;
+          }
+        }
+        return best;
+      },
+    });
+    return result || "";
+  } catch {
+    return "";
+  }
+}
+
+async function addTabToGroup(tabId, groupId) {
+  if (groupId == null || groupId === -1 || !tabId) return;
+  try {
+    await chrome.tabs.group({ tabIds: tabId, groupId });
+  } catch (e) {
+    await pushLog("warn", "無法加入群組", e.message || String(e));
+  }
+}
+
+async function runBatchSearchJob({ sourceTabId, queries, openFirstResult, delayMs }) {
+  batchSearchCancel = false;
+  batchSearchRunning = true;
+  let done = 0;
+  let failed = 0;
+
+  try {
+    const sourceTab = await chrome.tabs.get(sourceTabId);
+    if (!isWebTabUrl(sourceTab.url)) throw new Error("來源分頁不是有效網頁");
+    const groupId = sourceTab.groupId;
+    const searchConfig = await detectSiteSearchFromTab(sourceTabId);
+    const total = queries.length;
+
+    for (let i = 0; i < queries.length; i++) {
+      if (batchSearchCancel) break;
+      const query = queries[i];
+      const index = i + 1;
+      broadcastBatchProgress({ index, total, query, status: "running" });
+
+      const searchUrl = VDM.buildSearchUrl(searchConfig, query);
+      if (!searchUrl) {
+        failed++;
+        broadcastBatchProgress({ index, total, query, status: "error", note: "無法建立搜索 URL" });
+        continue;
+      }
+
+      try {
+        if (openFirstResult) {
+          const searchTab = await chrome.tabs.create({ url: searchUrl, active: false });
+          await waitTabComplete(searchTab.id);
+          const resultUrl = await pickFirstResultFromTab(searchTab.id);
+          try {
+            await chrome.tabs.remove(searchTab.id);
+          } catch {
+            /* ignore */
+          }
+          const finalUrl = resultUrl || searchUrl;
+          const resultTab = await chrome.tabs.create({ url: finalUrl, active: false });
+          await addTabToGroup(resultTab.id, groupId);
+          done++;
+          broadcastBatchProgress({
+            index,
+            total,
+            query,
+            status: resultUrl ? "done" : "skipped",
+            url: finalUrl,
+            note: resultUrl ? "" : "未找到首筆結果，已開搜索頁",
+          });
+        } else {
+          const tab = await chrome.tabs.create({ url: searchUrl, active: false });
+          await addTabToGroup(tab.id, groupId);
+          done++;
+          broadcastBatchProgress({ index, total, query, status: "done", url: searchUrl });
+        }
+      } catch (e) {
+        failed++;
+        const note = e.message === "cancelled" ? "已取消" : e.message || "失敗";
+        broadcastBatchProgress({ index, total, query, status: "error", note });
+        if (e.message === "cancelled") break;
+      }
+
+      if (delayMs > 0 && i < queries.length - 1 && !batchSearchCancel) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+
+    if (batchSearchCancel) {
+      broadcastBatchProgress({ status: "cancelled" });
+      await pushLog("info", `批量搜索已停止（${done}/${total}）`);
+    } else {
+      const summary = `完成 ${done}/${total}${failed ? `，失敗 ${failed}` : ""}`;
+      broadcastBatchProgress({ status: "finished", summary, done, failed, total });
+      await pushLog("info", `批量搜索：${summary}`);
+    }
+  } finally {
+    batchSearchRunning = false;
+    batchSearchCancel = false;
+  }
+}
+
+async function applyUiMode() {
+  if (!chrome.action?.setPopup) return;
+  try {
+    await chrome.action.setPopup({ popup: VDM.openInTab ? "" : MANAGER_PAGE });
+  } catch (e) {
+    console.error("VDM applyUiMode failed", e);
+  }
+}
+
+function taskSnapshot(t) {
+  const snap = {
+    id: t.id,
+    video: VDM.sanitizeTaskVideo(t.video),
+    fileName: t.fileName,
+    status: t.status,
+    progress: t.progress,
+    downloadProgress: t.downloadProgress,
+    mergeProgress: t.mergeProgress,
+    merged: t.merged,
+    downloaded: t.downloaded,
+    fetched: t.fetched,
+    total: t.total,
+    activity: t.activity || "",
+    segmentDir: t.segmentDir || "",
+    error: t.error,
+    speed: t.speed || 0,
+    startedAt: t.startedAt,
+    _userPaused: !!t._userPaused,
+    _autoRetryAt: t._autoRetryAt || 0,
+  };
+  if (t.segmentSubfolder !== undefined && t.segmentSubfolder !== null) {
+    snap.segmentSubfolder = t.segmentSubfolder;
+  }
+  if (t.importFsaKey) {
+    snap.importFsaKey = t.importFsaKey;
+  }
+  return snap;
+}
+
+const runtimeSessionId = crypto.randomUUID();
+
+async function touchRuntimeHeartbeat(task) {
+  try {
+    const active = engine.listActive().filter((t) =>
+      ["pending", "downloading", "merging"].includes(t.status)
+    );
+    const ref = task || active[0];
+    await chrome.storage.local.set({
+      vdmRuntime: {
+        sessionId: runtimeSessionId,
+        lastHeartbeat: Date.now(),
+        hadRunningTasks: active.length > 0,
+        cleanShutdown: false,
+        lastActivity: ref?.activity || ref?.status || "",
+        lastTaskName: ref?.fileName || "",
+        lastDownloadPct: ref?.downloadProgress ?? null,
+        lastMergePct: ref?.mergeProgress ?? null,
+        lastStatus: ref?.status || "",
+      },
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 依閃退前 activity 推測可能原因（非確診，Chrome 整窗關閉時擴充來不及寫 stack） */
+function inferCrashLikelyCause(runtime, runningSnaps) {
+  const act = String(runtime?.lastActivity || "");
+  const dl = runtime?.lastDownloadPct;
+  const mg = runtime?.lastMergePct;
+  const lag = dl != null && mg != null && dl - mg >= 25;
+
+  if (/FSA|存檔|準備存檔/.test(act)) {
+    return "可能原因：存檔階段記憶體或磁碟寫入壓力過高（大檔寫入時 Chrome 整进程被殺）";
+  }
+  if (/合併/.test(act) || lag) {
+    const lagHint = lag ? `（下載 ${dl}% 但合併僅 ${mg}%，大檔合併落後）` : "";
+    return `可能原因：邊下邊合併時 OPFS/磁碟 I/O 與記憶體壓力過高${lagHint}`;
+  }
+  if (/下載片段|HTTP 下載|解析 M3U8/.test(act)) {
+    return "可能原因：多段並行下載＋背景合併＋影片分頁仍在播放，整體記憶體/GPU 不足";
+  }
+  return "可能原因：Chrome 整进程異常終止（常見 OOM）；擴充無法取得確切 crash stack，請查 chrome://crashes";
+}
+
+async function markCleanShutdown() {
+  try {
+    const { vdmRuntime = {} } = await chrome.storage.local.get("vdmRuntime");
+    await chrome.storage.local.set({
+      vdmRuntime: {
+        ...vdmRuntime,
+        hadRunningTasks: false,
+        cleanShutdown: true,
+        lastHeartbeat: Date.now(),
+      },
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function detectAbnormalShutdown() {
+  try {
+    const { vdmRuntime = null, vdmActiveTasks = [] } = await chrome.storage.local.get([
+      "vdmRuntime",
+      "vdmActiveTasks",
+    ]);
+    if (!vdmRuntime?.hadRunningTasks || vdmRuntime.cleanShutdown) return;
+
+    const elapsed = Date.now() - (vdmRuntime.lastHeartbeat || 0);
+    if (elapsed > 10 * 60 * 1000) return;
+
+    const runningSnaps = vdmActiveTasks.filter((t) =>
+      ["downloading", "merging", "pending"].includes(t.status)
+    );
+    if (!runningSnaps.length) return;
+
+    const names = runningSnaps.map((t) => t.fileName || t.id).slice(0, 3).join("、");
+    const extra = runningSnaps.length > 3 ? ` 等 ${runningSnaps.length} 個` : "";
+    const progress =
+      vdmRuntime.lastDownloadPct != null
+        ? `進度：下載 ${vdmRuntime.lastDownloadPct}%  ·  合併 ${vdmRuntime.lastMergePct ?? "?"}%`
+        : "";
+    const detail = [
+      "整個 Chrome 視窗消失 = 瀏覽器进程被系統強制結束，擴充來不及寫入即時錯誤。",
+      inferCrashLikelyCause(vdmRuntime, runningSnaps),
+      vdmRuntime.lastActivity ? `最後操作：${vdmRuntime.lastActivity}` : "",
+      progress,
+      `任務：${names}${extra}`,
+      `距上次心跳：${Math.round(elapsed / 1000)} 秒`,
+      "確診請開 chrome://crashes 或 Windows 事件檢視器。",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await pushLog("error", "[Chrome 整窗閃退] 上次非正常結束", detail);
+  } catch {
+    /* ignore */
+  }
+}
+
+let persistTasksTimer = null;
+async function persistTasksNow() {
+  if (persistTasksTimer) {
+    clearTimeout(persistTasksTimer);
+    persistTasksTimer = null;
+  }
+  try {
+    const tasks = engine.listActive().map(taskSnapshot);
+    await chrome.storage.local.set({ vdmActiveTasks: tasks });
+  } catch {
+    /* ignore */
+  }
+}
+
+function schedulePersistTasks() {
+  if (persistTasksTimer) return;
+  persistTasksTimer = setTimeout(async () => {
+    persistTasksTimer = null;
+    await persistTasksNow();
+  }, 250);
+}
+
+async function restoreTasks() {
+  const { vdmActiveTasks = [] } = await chrome.storage.local.get("vdmActiveTasks");
+  for (const snap of vdmActiveTasks) {
+    if (!snap?.id) continue;
+    if (!["pending", "downloading", "merging", "paused", "failed"].includes(snap.status)) continue;
+    engine.restoreTask(snap);
+  }
+  for (const t of engine.listActive()) {
+    if (autoRetryEligible(t)) scheduleAutoRetry(t);
+  }
+}
+
+const initPromise = (async function init() {
+  try {
+    VDM.diag(`背景 Service Worker 啟動 v${chrome.runtime.getManifest().version}`);
+    await detectAbnormalShutdown();
+    await store.restore();
+    await restoreTasks();
+    await loadSettings();
+    await applyUiMode();
+    await persistTasksNow();
+    await touchRuntimeHeartbeat(null);
+  } catch (e) {
+    console.error("VDM restore failed", e);
+  }
+})();
+
+chrome.action.onClicked.addListener(async (tab) => {
+  await loadSettings();
+  if (!VDM.openInTab) return;
+  const resolved = await resolveTargetTabId(tab?.id);
+  await openManagerTab(resolved.tabId || tab?.id);
+});
+
+VDM._logFn = (level, message, detail) => {
+  pushLog(level, message, detail);
+};
+
+VDM._activityFn = (task) => {
+  touchRuntimeHeartbeat(task).catch(() => {});
+};
+
+async function resolvePageUrl(tabId) {
+  const cached = store.getTabUrl(tabId);
+  if (cached && !cached.startsWith("chrome")) return cached;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.url && !tab.url.startsWith("chrome")) {
+      store.setTabUrl(tabId, tab.url);
+      return tab.url;
+    }
+  } catch {
+    /* tab gone */
+  }
+  return cached || "";
+}
+
+function broadcast(message) {
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
+const logDedupe = new Map();
+let logBroadcastTimer = null;
+
+function scheduleLogBroadcast() {
+  if (logBroadcastTimer) return;
+  logBroadcastTimer = setTimeout(() => {
+    logBroadcastTimer = null;
+    broadcast({ type: "LOG_UPDATED" });
+  }, 2000);
+}
+
+async function pushLog(level, message, detail = "") {
+  if (level === "debug") return;
+  try {
+    const key = `${level}|${message}|${detail}`;
+    const now = Date.now();
+    const prev = logDedupe.get(key);
+    if (prev && now - prev < 8000) return;
+    logDedupe.set(key, now);
+
+    const { vdmLogs = [] } = await chrome.storage.local.get("vdmLogs");
+    vdmLogs.unshift({
+      time: now,
+      level,
+      message: String(message),
+      detail: detail ? String(detail) : "",
+    });
+    if (vdmLogs.length > 60) vdmLogs.length = 60;
+    await chrome.storage.local.set({ vdmLogs });
+    scheduleLogBroadcast();
+  } catch (e) {
+    console.error("VDM log failed", e);
+  }
+}
+
+async function pushCompletedTask(task) {
+  const { vdmCompleted = [] } = await chrome.storage.local.get("vdmCompleted");
+  vdmCompleted.unshift({
+    id: task.id,
+    fileName: task.fileName,
+    pageUrl: task.video?.pageUrl || "",
+    quality: task.video?.quality || 0,
+    completedAt: Date.now(),
+  });
+  if (vdmCompleted.length > 50) vdmCompleted.length = 50;
+  await chrome.storage.local.set({ vdmCompleted });
+  broadcast({ type: "COMPLETED_UPDATED" });
+}
+
+const taskBroadcastAt = new Map();
+const autoRetryTimers = new Map();
+
+/** 任務是否尚未下載完成 */
+function taskIncomplete(t) {
+  if (!t?.total) return false;
+  const hls = t.video?.isM3u8 || /\.m3u8/i.test(t.video?.url || "");
+  if (hls && VDM.segmentsOnly !== false) {
+    return (t.downloaded || 0) < t.total;
+  }
+  if (hls) return (t.merged || 0) < t.total;
+  return (t.downloaded || 0) < t.total;
+}
+
+/** 判斷任務是否符合自動重試 / 自動繼續 */
+function autoRetryEligible(t) {
+  if (!t || t._userPaused) return false;
+  if (t.status === "paused" && taskIncomplete(t)) {
+    if (/HTTP (403|401|429)/.test(t.error || "")) return false;
+    if (VDM.isFetchBlocked?.(t.video)) return false;
+    return "resume";
+  }
+  if (t.status === "failed" && /Failed to fetch|M3U8 失敗|network error/i.test(t.error || "")) {
+    return "retry";
+  }
+  return false;
+}
+
+function scheduleAutoRetry(task) {
+  if (autoRetryTimers.has(task.id)) return;
+  const mode = autoRetryEligible(task);
+  if (!mode) return;
+  const delayMs = mode === "resume" ? 5000 : 10_000;
+  task._autoRetryAt = Date.now() + delayMs;
+  if (mode === "resume") {
+    task.error = "";
+    const secs = Math.round(delayMs / 1000);
+    VDM.setTaskActivity(task, `${secs} 秒後自動繼續…`);
+  }
+  const timerId = setTimeout(async () => {
+    autoRetryTimers.delete(task.id);
+    const t = engine.tasks.get(task.id);
+    const retryMode = autoRetryEligible(t);
+    if (!retryMode) return;
+    delete t._autoRetryAt;
+    try {
+      await loadSettings();
+      const newTabId = await findTabByPageUrl(t.video?.pageUrl);
+      if (newTabId) {
+        t.video.tabId = newTabId;
+        prepareVideoForDownload(t.video, t.video.pageUrl);
+      }
+      await setDownloadHeaderRule(t.video?.referer || t.video?.pageUrl || "");
+      if (retryMode === "resume") {
+        if (await engine.resume(t.id, handleTaskProgress)) {
+          await pushLog("info", `自動繼續：${t.fileName}`);
+        }
+      } else {
+        await engine.retry(t.id, handleTaskProgress);
+        await pushLog("info", `自動重試：${t.fileName}`);
+      }
+    } catch (e) {
+      console.error("VDM auto-retry failed", e);
+    }
+  }, delayMs);
+  autoRetryTimers.set(task.id, timerId);
+  broadcastTask(task);
+}
+
+function cancelAutoRetry(taskId) {
+  const timerId = autoRetryTimers.get(taskId);
+  if (timerId != null) {
+    clearTimeout(timerId);
+    autoRetryTimers.delete(taskId);
+  }
+  const t = engine.tasks.get(taskId);
+  if (t) {
+    delete t._autoRetryAt;
+  }
+}
+
+function broadcastTask(task) {
+  const now = Date.now();
+  const last = taskBroadcastAt.get(task.id) || 0;
+  const terminal = ["failed", "completed", "cancelled"].includes(task.status);
+  if (!terminal && now - last < 450) return;
+  taskBroadcastAt.set(task.id, now);
+  // 傳送精簡快照：去掉 requestHeaders 等大型欄位，UI 不需要這些
+  broadcast({ type: "TASK_UPDATED", task: taskSnapshot(task) });
+}
+
+function updateBadge(tabId) {
+  const count = store.countForTab(tabId);
+  const text = count > 0 ? String(count) : "";
+  chrome.action.setBadgeText({ tabId, text });
+  chrome.action.setBadgeBackgroundColor({ tabId, color: "#067EFF" });
+}
+
+async function handleSniff(url, tabId, pageUrl, referer) {
+  if (!url || !tabId || tabId < 0) return;
+  if (!pageUrl || pageUrl.startsWith("chrome")) return;
+  if (VDM.isYoutubeUrl(url) || VDM.isYoutubeUrl(pageUrl)) return;
+  if (!VDM.isVideoUrl(url) || VDM.isLikelyAdUrl(url)) return;
+
+  store.setTabUrl(tabId, pageUrl);
+
+  if (/\.m3u8/i.test(url)) {
+    const key = `${tabId}:${VDM.normalizeUrl(url)}`;
+    if (m3u8Pending.has(key)) return;
+    m3u8Pending.add(key);
+    try {
+      await parseAndStoreM3u8(url, tabId, pageUrl, referer || pageUrl);
+    } finally {
+      setTimeout(() => m3u8Pending.delete(key), 3000);
+    }
+    return;
+  }
+
+  const size = await probeSize(url, referer || pageUrl);
+  if (VDM.isPreviewClip(url, size) && size === 0) return;
+  if (size === 0 && !/\.(mp4|webm|m3u8)(\?|$)/i.test(url)) return;
+
+  const quality = VDM.guessQuality(url);
+  if (size && size < VDM.MIN_MAIN_BYTES && quality && quality < VDM.MIN_MAIN_QUALITY) {
+    if (!VDM.isPreviewClip(url, size)) return;
+  }
+
+  const pageTitle = await resolvePageTitle(tabId, pageUrl);
+  const ext = url.split("?")[0].split(".").pop().toLowerCase();
+  const video = VDM.createVideo({
+    url,
+    pageUrl,
+    tabId,
+    title: pageTitle,
+    quality,
+    mimeType: ext === "mp4" || ext === "m4v" ? "video/mp4" : `video/${ext}`,
+    referer: VDM.bestReferer(url, pageUrl, referer || pageUrl),
+    requestHeaders: requestHeadersForUrl(url),
+    size,
+  });
+  video.tabId = tabId;
+  attachCachedPoster(video, tabId);
+
+  if (store.add(video)) {
+    if (!video.posterUrl) {
+      resolvePosterUrl(tabId)
+        .then((poster) => {
+          if (poster) applyPosterToTab(tabId, poster, pageUrl);
+        })
+        .catch(() => {});
+    }
+    await store.persist();
+    updateBadge(tabId);
+    broadcast({ type: "VIDEOS_UPDATED", tabId, pageUrl });
+  }
+}
+
+function requestHeadersForUrl(url) {
+  return VDM.peekRequestHeaders(url);
+}
+
+function attachCachedPoster(video, tabId) {
+  const cached = tabPosterBest.get(tabId);
+  if (cached?.url && !video.posterUrl) video.posterUrl = cached.url;
+}
+
+function applyPosterToTab(tabId, url, pageUrl) {
+  if (!url || tabId < 0) return false;
+  const score = VDM.scorePosterUrl(url);
+  const prev = tabPosterBest.get(tabId);
+  if (prev && prev.score >= score) return false;
+  tabPosterBest.set(tabId, { url, score });
+  let changed = false;
+  for (const v of store.getForTab(tabId)) {
+    const curScore = v.posterUrl ? VDM.scorePosterUrl(v.posterUrl) : -1;
+    if (score > curScore) {
+      v.posterUrl = url;
+      changed = true;
+    }
+  }
+  if (changed) {
+    store.persist();
+    broadcast({ type: "VIDEOS_UPDATED", tabId, pageUrl });
+  }
+  return true;
+}
+
+function handlePosterSniff(url, tabId, pageUrl, { trusted = false } = {}) {
+  if (!url || tabId < 0 || !pageUrl || pageUrl.startsWith("chrome")) return;
+  if (VDM.isYoutubeUrl(pageUrl)) return;
+  if (!trusted && !VDM.isPosterImageUrl(url)) return;
+  store.setTabUrl(tabId, pageUrl);
+  applyPosterToTab(tabId, url, pageUrl);
+}
+
+// 串化所有 declarativeNetRequest.updateDynamicRules 呼叫，
+// 防止並行呼叫產生 duplicate rule ID → Chrome bad-message crash
+let _dnrChain = Promise.resolve();
+function withDnrLock(fn) {
+  _dnrChain = _dnrChain.then(fn, fn);
+  return _dnrChain;
+}
+
+async function setDownloadHeaderRule(referer) {
+  if (!referer || !chrome.declarativeNetRequest?.updateDynamicRules) return;
+  return withDnrLock(async () => {
+    let origin = "";
+    try {
+      origin = new URL(referer).origin;
+    } catch {
+      /* ignore */
+    }
+    // 截斷過長的 header 值，避免觸發 Chrome IPC 驗證失敗
+    const safeReferer = referer.slice(0, 4096);
+    const safeOrigin = origin.slice(0, 256);
+    const requestHeaders = [
+      { header: "Referer", operation: "set", value: safeReferer },
+    ];
+    if (safeOrigin) requestHeaders.push({ header: "Origin", operation: "set", value: safeOrigin });
+    try {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [DOWNLOAD_HDR_RULE],
+        addRules: [
+          {
+            id: DOWNLOAD_HDR_RULE,
+            priority: 1,
+            action: { type: "modifyHeaders", requestHeaders },
+            condition: {
+              urlFilter: "|https",
+              resourceTypes: ["xmlhttprequest", "media", "other", "image"],
+            },
+          },
+        ],
+      });
+      await pushLog("debug", "已套用下載 Referer 規則", safeReferer.slice(0, 100));
+    } catch (e) {
+      await pushLog("warn", "Referer 規則套用失敗", e.message || String(e));
+    }
+  });
+}
+
+async function clearDownloadHeaderRule() {
+  if (!chrome.declarativeNetRequest?.updateDynamicRules) return;
+  return withDnrLock(async () => {
+    try {
+      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [DOWNLOAD_HDR_RULE] });
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+function prepareVideoForDownload(video, pageUrl) {
+  const fresh = requestHeadersForUrl(video.url);
+  if (fresh) video.requestHeaders = fresh;
+  video.referer = VDM.bestReferer(video.url, pageUrl, video.referer || pageUrl);
+  return video;
+}
+
+function normalizeSubfolder(name) {
+  return VDM.normalizeDownloadPath(name);
+}
+
+async function resolvePageTitle(tabId, pageUrl) {
+  const cached = tabTitles.get(tabId);
+  if (cached && !/^https?:\/\//i.test(cached)) return cached;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.title && !/^https?:\/\//i.test(tab.title)) {
+      tabTitles.set(tabId, tab.title);
+      return tab.title;
+    }
+  } catch {
+    /* tab gone */
+  }
+  try {
+    const slug = decodeURIComponent(
+      new URL(pageUrl).pathname.split("/").filter(Boolean).pop() || ""
+    );
+    if (slug) return slug;
+  } catch {
+    /* ignore */
+  }
+  return "video";
+}
+
+async function resolvePosterUrl(tabId, { waitMs = 0 } = {}) {
+  if (!tabId || !chrome.scripting?.executeScript) return "";
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: (maxWait) => {
+        const abs = (u) => {
+          try {
+            return new URL(u, location.href).href;
+          } catch {
+            return "";
+          }
+        };
+        const pick = () => {
+          for (const v of document.querySelectorAll("video")) {
+            const p = v.poster || v.getAttribute("poster");
+            if (p) return abs(p);
+          }
+          for (const sel of [
+            'meta[property="og:image"]',
+            'meta[property="og:image:url"]',
+            'meta[property="og:image:secure_url"]',
+            'meta[name="twitter:image"]',
+            'meta[name="twitter:image:src"]',
+            'link[rel="image_src"]',
+          ]) {
+            const el = document.querySelector(sel);
+            const href = el?.content || el?.href;
+            if (href) return abs(href);
+          }
+          for (const sel of [
+            ".vjs-poster img",
+            ".plyr__poster",
+            '[class*="poster"] img',
+            'img[class*="thumb"]',
+            'img[class*="cover"]',
+            ".video-player img",
+            "#player img",
+          ]) {
+            const el = document.querySelector(sel);
+            const src = el?.src || el?.getAttribute("data-src");
+            if (src) return abs(src);
+          }
+          let best = null;
+          let bestArea = 0;
+          for (const img of document.querySelectorAll("img")) {
+            const w = img.naturalWidth || img.width || 0;
+            const h = img.naturalHeight || img.height || 0;
+            if (w < 160 || h < 90) continue;
+            const area = w * h;
+            if (area > bestArea) {
+              bestArea = area;
+              best = img;
+            }
+          }
+          if (best?.src) return abs(best.src);
+          return "";
+        };
+        if (!maxWait) return pick();
+        return new Promise((resolve) => {
+          let url = pick();
+          if (url) {
+            resolve(url);
+            return;
+          }
+          const deadline = Date.now() + maxWait;
+          const done = (finalUrl) => {
+            obs.disconnect();
+            resolve(finalUrl || "");
+          };
+          const obs = new MutationObserver(() => {
+            url = pick();
+            if (url) done(url);
+          });
+          obs.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+          });
+          const tick = () => {
+            url = pick();
+            if (url) {
+              done(url);
+              return;
+            }
+            if (Date.now() >= deadline) {
+              done(pick());
+              return;
+            }
+            setTimeout(tick, 200);
+          };
+          setTimeout(tick, 200);
+        });
+      },
+      args: [waitMs],
+    });
+    return result || "";
+  } catch {
+    return "";
+  }
+}
+
+VDM.resolvePosterUrl = resolvePosterUrl;
+
+async function attachPostersForTab(tabId) {
+  const pageUrl = store.getTabUrl(tabId);
+  const cached = tabPosterBest.get(tabId);
+  if (cached?.url) {
+    applyPosterToTab(tabId, cached.url, pageUrl);
+    return;
+  }
+  const posterUrl = await resolvePosterUrl(tabId);
+  if (posterUrl) applyPosterToTab(tabId, posterUrl, pageUrl);
+}
+
+const coverSaveQueue = [];
+let coverPumpRunning = false;
+
+async function pumpCoverSaveQueue() {
+  if (coverPumpRunning) return;
+  coverPumpRunning = true;
+  while (coverSaveQueue.length) {
+    const { video, fileNameBase, tabId } = coverSaveQueue.shift();
+    try {
+      const ok = await VDM.saveCoverJpg(video, fileNameBase, tabId);
+      if (ok) await pushLog("info", `封面已存檔：${fileNameBase}.jpg`);
+    } catch {
+      /* ignore */
+    }
+  }
+  coverPumpRunning = false;
+}
+
+function queueCoverSave(video, fileNameBase, tabId) {
+  coverSaveQueue.push({ video, fileNameBase, tabId });
+  pumpCoverSaveQueue();
+}
+
+function hlsDisplayTitle(pageTitle, { resolution = 0, quality = 0 } = {}) {
+  const base = String(pageTitle || "video").trim() || "video";
+  if (resolution > 0) return `${base} (${resolution}P)`;
+  if (quality > 0) return `${base} (${VDM.qualityLabel(quality)})`;
+  return base;
+}
+
+function enrichVideoTitles(videos, pageTitle) {
+  if (!pageTitle) return videos;
+  for (const v of videos) {
+    if (v.title && !VDM.isGenericHlsTitle(v.title)) continue;
+    v.title = hlsDisplayTitle(pageTitle, v);
+  }
+  return videos;
+}
+
+function pickBestVideo(videos) {
+  if (!videos?.length) return null;
+  let best = videos[0];
+  for (const v of videos) {
+    const vq = v.quality || 0;
+    const bq = best.quality || 0;
+    if (vq > bq || (vq === bq && (v.size || 0) > (best.size || 0))) best = v;
+  }
+  return best;
+}
+
+async function handleTaskCompleted(t) {
+  const doneMsg = VDM.segmentsOnly !== false && (t.video?.isM3u8 || /\.m3u8/i.test(t.video?.url || ""))
+    ? `片段下載完成：${t.segmentDir || t.fileName}`
+    : `下載完成：${t.fileName}`;
+  await pushLog("info", doneMsg);
+  const coverBase = t.fileName.replace(/\.mp4$/i, "");
+  if (!t.video?._coverSaved) {
+    queueCoverSave(t.video, coverBase, t.video?.tabId);
+  }
+  await pushCompletedTask(t);
+  engine.tasks.delete(t.id);
+  engine.controllers.delete(t.id);
+  if (!engine.listActive().length && !engine.waitQueue.length) {
+    clearDownloadHeaderRule();
+  }
+  await persistTasksNow().catch(() => {});
+}
+
+function handleTaskProgress(t) {
+  const eligible = autoRetryEligible(t);
+  if (!eligible) {
+    cancelAutoRetry(t.id);
+  } else if (!autoRetryTimers.has(t.id)) {
+    scheduleAutoRetry(t); // _autoRetryAt 和 _autoRetryCount 由 scheduleAutoRetry 管理
+  }
+  touchRuntimeHeartbeat(t).catch(() => {});
+  broadcastTask(t);
+  if (t.status === "failed") {
+    pushLog("error", `下載失敗：${t.fileName}`, t.error || "未知錯誤");
+  }
+  if (t.status === "completed") {
+    void handleTaskCompleted(t);
+    return;
+  }
+  // cancelled 僅由 engine.cancel() 處理；fetch 中斷改為 paused，不再在此刪除任務
+  if (["failed", "completed", "cancelled"].includes(t.status)) {
+    if (!engine.listActive().length && !engine.waitQueue.length) {
+      clearDownloadHeaderRule();
+    }
+  }
+  if (["paused", "failed", "pending", "completed", "cancelled"].includes(t.status)) {
+    persistTasksNow().catch(() => {});
+  } else {
+    schedulePersistTasks();
+  }
+}
+
+async function resolveCoverMeta(video, tabId, { posterWaitMs = 1200 } = {}) {
+  if (!video.posterUrl) {
+    const cached = tabPosterBest.get(tabId);
+    if (cached?.url) video.posterUrl = cached.url;
+  }
+  if (!video.posterUrl) {
+    video.posterUrl = await resolvePosterUrl(tabId, { waitMs: posterWaitMs });
+  }
+  return !!video.posterUrl;
+}
+
+function buildPcFileName(saveName) {
+  const base = String(saveName || "video").replace(/\.mp4$/i, "");
+  return `${base}.mp4`;
+}
+
+async function buildPcTaskPayloads(items) {
+  const usedNames = new Set();
+  const pending = [];
+
+  for (const { video, tabId, pageUrl, pageTitle } of items) {
+    video.tabId = tabId;
+    prepareVideoForDownload(video, pageUrl);
+
+    let saveName = VDM.buildSaveFilename(pageTitle, pageUrl);
+    if (usedNames.has(saveName)) {
+      let n = 2;
+      while (usedNames.has(`${saveName}_${n}`)) n++;
+      saveName = `${saveName}_${n}`;
+    }
+    usedNames.add(saveName);
+    pending.push({ video, saveName, pageUrl, tabId });
+  }
+
+  if (!pending.length) return [];
+
+  return pending.map(({ video, saveName }) => ({
+    id: VDM.uid(),
+    video: VDM.sanitizeTaskVideo(video),
+    fileName: buildPcFileName(saveName),
+    status: "pending",
+  }));
+}
+
+async function pushDownloadItemsToPc(items) {
+  const tasks = await buildPcTaskPayloads(items);
+  if (!tasks.length) return [];
+  await VDM.pushTasksToPc(tasks);
+  await pushLog("info", `已送至 PC 版：${tasks.length} 個任務`);
+  return tasks;
+}
+
+async function downloadCoversForItems(items) {
+  if (!items.length) return { count: 0, total: 0 };
+  const batchMode = items.length > 1;
+  const posterWaitMs = batchMode ? 250 : 1200;
+  const usedNames = new Set();
+  let done = 0;
+
+  for (const { video, tabId, pageUrl, pageTitle } of items) {
+    video.tabId = tabId;
+    attachCachedPoster(video, tabId);
+    await attachPostersForTab(tabId).catch(() => {});
+    attachCachedPoster(video, tabId);
+    prepareVideoForDownload(video, pageUrl);
+
+    let saveName = VDM.buildSaveFilename(pageTitle, pageUrl);
+    if (usedNames.has(saveName)) {
+      let n = 2;
+      while (usedNames.has(`${saveName}_${n}`)) n++;
+      saveName = `${saveName}_${n}`;
+    }
+    usedNames.add(saveName);
+
+    if (await prepareCoverForDownload(video, tabId, saveName, { posterWaitMs }).catch(() => false)) {
+      done++;
+    }
+  }
+
+  return { count: done, total: items.length };
+}
+
+async function prepareCoverForDownload(video, tabId, saveName, { posterWaitMs = 1200 } = {}) {
+  if (!video.posterUrl) {
+    const cached = tabPosterBest.get(tabId);
+    if (cached?.url) video.posterUrl = cached.url;
+  }
+  if (!video.posterUrl) {
+    video.posterUrl = await resolvePosterUrl(tabId, { waitMs: posterWaitMs });
+  }
+  if (!video.posterUrl) {
+    await pushLog("warn", `找不到封面：${saveName}`, String(video.pageUrl || "").slice(0, 120));
+    return false;
+  }
+  await setDownloadHeaderRule(video.referer || video.pageUrl || "");
+  const ok = await VDM.saveCoverJpg(video, saveName, tabId);
+  if (ok) {
+    await pushLog("info", `封面已存檔：${saveName}.jpg`);
+  } else {
+    await pushLog("warn", `封面下載失敗：${saveName}.jpg`, video.posterUrl.slice(0, 120));
+  }
+  return ok;
+}
+
+async function enqueueDownloadTasks(items) {
+  const activeUrls = new Set(
+    engine.listActive().map((t) => VDM.normalizeUrl(t.video?.url || ""))
+  );
+  const usedNames = new Set();
+  const pending = [];
+
+  for (const { video, tabId, pageUrl, pageTitle } of items) {
+    const norm = VDM.normalizeUrl(video.url);
+    if (activeUrls.has(norm)) continue;
+    activeUrls.add(norm);
+
+    video.tabId = tabId;
+    prepareVideoForDownload(video, pageUrl);
+
+    let saveName = VDM.buildSaveFilename(pageTitle, pageUrl);
+    if (usedNames.has(saveName)) {
+      let n = 2;
+      while (usedNames.has(`${saveName}_${n}`)) n++;
+      saveName = `${saveName}_${n}`;
+    }
+    usedNames.add(saveName);
+
+    pending.push({ video, saveName, pageUrl, tabId });
+  }
+
+  if (!pending.length) return [];
+
+  const batchMode = pending.length > 1;
+  const posterWaitMs = batchMode ? 250 : 1200;
+
+  const primary = prepareVideoForDownload(pending[0].video, pending[0].pageUrl);
+  await setDownloadHeaderRule(primary.referer);
+
+  const started = [];
+  for (const { video, saveName } of pending) {
+    const task = engine.createTask(video, saveName);
+    started.push(task);
+    engine.enqueue(task, handleTaskProgress);
+  }
+
+  Promise.all(
+    pending.map(({ video, tabId, saveName }) =>
+      prepareCoverForDownload(video, tabId, saveName, { posterWaitMs }).catch(() => false)
+    )
+  ).catch(() => {});
+
+  schedulePersistTasks();
+  return started;
+}
+
+async function collectGroupDownloadItems(anchorTabId) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(anchorTabId);
+  } catch {
+    return { error: "找不到分頁" };
+  }
+  const groupId = tab.groupId;
+  if (groupId == null || groupId === -1) {
+    return { error: "目前分頁不在任何 Chrome 群組中" };
+  }
+  const groupTabs = await chrome.tabs.query({ groupId });
+  const webTabs = groupTabs.filter((t) => isWebTabUrl(t.url));
+  const rows = await Promise.all(
+    webTabs.map(async (t) => {
+      const pageUrl = t.url;
+      const pageTitle = await resolvePageTitle(t.id, pageUrl);
+      const all = enrichVideoTitles(store.getForTab(t.id), pageTitle);
+      const best = pickBestVideo(all);
+      if (!best) return null;
+      return { video: best, tabId: t.id, pageUrl, pageTitle };
+    })
+  );
+  const items = rows.filter(Boolean);
+  return { groupId, items };
+}
+
+async function getTabGroupInfo(anchorTabId) {
+  if (!anchorTabId) return { inGroup: false };
+  try {
+    const tab = await chrome.tabs.get(anchorTabId);
+    const groupId = tab.groupId;
+    if (groupId == null || groupId === -1) return { inGroup: false };
+    const groupTabs = await chrome.tabs.query({ groupId });
+    const webTabs = groupTabs.filter((t) => isWebTabUrl(t.url));
+    const hits = await Promise.all(
+      webTabs.map((t) => Promise.resolve(!!pickBestVideo(store.getForTab(t.id))))
+    );
+    const downloadable = hits.filter(Boolean).length;
+    return { inGroup: true, groupId, tabCount: groupTabs.length, downloadable };
+  } catch {
+    return { inGroup: false };
+  }
+}
+
+function pathInSubfolder(filename, subfolder) {
+  const f = String(filename || "").replace(/\\/g, "/");
+  const s = normalizeSubfolder(subfolder);
+  return f.includes(`/${s}/`) || f.startsWith(`${s}/`) || f.endsWith(`/${s}`);
+}
+
+async function waitDownloadComplete(downloadId, timeoutMs = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const [item] = await chrome.downloads.search({ id: downloadId });
+    if (item?.state === "complete") return item;
+    if (item?.state === "interrupted") {
+      throw new Error(item.error || "下載標記檔失敗");
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("開啟資料夾逾時");
+}
+
+async function openDownloadSubfolder(subfolder) {
+  const clean = normalizeSubfolder(subfolder);
+  const items = await chrome.downloads.search({
+    orderBy: ["-startTime"],
+    limit: 80,
+  });
+  const hit = items.find((item) => pathInSubfolder(item.filename, clean));
+  if (hit) {
+    await chrome.downloads.show(hit.id);
+    return { ok: true };
+  }
+  const downloadId = await chrome.downloads.download({
+    url: "data:text/plain,Video%20Downloads%20Manager",
+    filename: `${clean}/.vdm-folder.txt`,
+    conflictAction: "overwrite",
+    saveAs: false,
+  });
+  await waitDownloadComplete(downloadId);
+  await chrome.downloads.show(downloadId);
+  return { ok: true };
+}
+
+async function probeSize(url, referer) {
+  try {
+    const headers = await VDM.buildHeaders(
+      { url, referer, pageUrl: referer },
+      url
+    );
+    let res = await fetch(url, { method: "HEAD", headers });
+    if (!res.ok) {
+      res = await fetch(url, { method: "GET", headers });
+    }
+    const len = parseInt(res.headers.get("content-length") || "0", 10);
+    if (len && len < VDM.MIN_MAIN_BYTES && !/\.m3u8/i.test(url)) {
+      if (VDM.isPreviewClip(url, len)) return len;
+      return 0;
+    }
+    return len;
+  } catch {
+    return 0;
+  }
+}
+
+async function parseAndStoreM3u8(url, tabId, pageUrl, referer) {
+  const bestRef = VDM.bestReferer(url, pageUrl, referer);
+  const pageTitle = await resolvePageTitle(tabId, pageUrl);
+  const baseVideo = {
+    pageUrl,
+    tabId,
+    referer: bestRef,
+    userAgent: VDM.USER_AGENT,
+    requestHeaders: requestHeadersForUrl(url),
+  };
+  let added = false;
+
+  try {
+    const playlist = await VDM.fetchM3u8(url, { ...baseVideo, url });
+
+    if (playlist.isVariant) {
+      const variants = playlist.playlists
+        .filter((p) => !VDM.isLikelyAdUrl(p.url))
+        .filter((p) => !p.bandwidth || p.bandwidth >= 400_000)
+        .filter((p) => !p.resolution || p.resolution >= VDM.MIN_MAIN_QUALITY)
+        .sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0) || (b.resolution || 0) - (a.resolution || 0))
+        .slice(0, 4);
+
+      const variantRows = await Promise.all(
+        variants.map(async (variant) => {
+          let duration = 0;
+          let estimatedSize = 0;
+          try {
+            const sub = await VDM.fetchM3u8(variant.url, { ...baseVideo, url: variant.url });
+            const meta = VDM.m3u8Meta(sub, variant.bandwidth);
+            duration = meta.duration;
+            estimatedSize = meta.estimatedSize;
+          } catch {
+            /* ignore */
+          }
+          return { variant, duration, estimatedSize };
+        })
+      );
+
+      for (const { variant, duration, estimatedSize } of variantRows) {
+        const video = VDM.createVideo({
+          ...baseVideo,
+          url: variant.url,
+          title: hlsDisplayTitle(pageTitle, {
+            resolution: variant.resolution,
+            quality: variant.resolution || VDM.guessQuality(variant.url),
+          }),
+          quality: variant.resolution || VDM.guessQuality(variant.url),
+          isM3u8: true,
+          duration,
+          size: estimatedSize,
+          mimeType: "application/vnd.apple.mpegurl",
+        });
+        video.tabId = tabId;
+        attachCachedPoster(video, tabId);
+        if (store.add(video)) added = true;
+      }
+    } else {
+      const quality = VDM.guessQuality(url);
+      const meta = VDM.m3u8Meta(playlist);
+      if (playlist.segments.length <= 2 && quality < VDM.MIN_MAIN_QUALITY) return;
+      const video = VDM.createVideo({
+        ...baseVideo,
+        url,
+        title: hlsDisplayTitle(pageTitle, { quality }),
+        quality,
+        isM3u8: true,
+        duration: meta.duration,
+        size: meta.estimatedSize,
+        mimeType: "application/vnd.apple.mpegurl",
+      });
+      video.tabId = tabId;
+      attachCachedPoster(video, tabId);
+      if (store.add(video)) added = true;
+    }
+  } catch {
+    if (!added && !VDM.isLikelyAdUrl(url)) {
+      const video = VDM.createVideo({
+        ...baseVideo,
+        url,
+        title: pageTitle,
+        quality: VDM.guessQuality(url),
+        isM3u8: true,
+        mimeType: "application/vnd.apple.mpegurl",
+      });
+      video.tabId = tabId;
+      attachCachedPoster(video, tabId);
+      if (store.add(video)) added = true;
+    }
+  }
+
+  if (added) {
+    await store.persist();
+    attachPostersForTab(tabId).catch(() => {});
+    updateBadge(tabId);
+    broadcast({ type: "VIDEOS_UPDATED", tabId, pageUrl });
+  }
+}
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    if (VDM.isVideoUrl(details.url)) {
+      VDM.rememberRequestHeaders(details.url, details.requestHeaders);
+      if (/\.ts(?:\?|$)/i.test(details.url)) return;
+      const cached = requestHeadersForUrl(details.url);
+      const referer = cached?.Referer || cached?.referer || "";
+      resolvePageUrl(details.tabId).then((pageUrl) => {
+        if (!pageUrl) return;
+        handleSniff(details.url, details.tabId, pageUrl, referer || pageUrl);
+      });
+      return;
+    }
+    if (VDM.isPosterImageUrl(details.url)) {
+      VDM.rememberRequestHeaders(details.url, details.requestHeaders);
+      resolvePageUrl(details.tabId).then((pageUrl) => {
+        if (!pageUrl) return;
+        handlePosterSniff(details.url, details.tabId, pageUrl);
+      });
+    }
+  },
+  { urls: ["<all_urls>"] },
+  ["requestHeaders", "extraHeaders"]
+);
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (details.tabId < 0 || details.type === "main_frame") return;
+    if (VDM.isVideoUrl(details.url)) return;
+    if (!VDM.isPosterImageUrl(details.url)) return;
+    resolvePageUrl(details.tabId).then((pageUrl) => {
+      if (!pageUrl) return;
+      handlePosterSniff(details.url, details.tabId, pageUrl);
+    });
+  },
+  { urls: ["<all_urls>"] }
+);
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (details.type !== "main_frame" || details.tabId < 0) return;
+    const url = details.url;
+    if (!url || url.startsWith("chrome")) return;
+    tabPosterBest.delete(details.tabId);
+    store.clearTab(details.tabId);
+    store.setTabUrl(details.tabId, url);
+    store.persist();
+    updateBadge(details.tabId);
+    broadcast({ type: "VIDEOS_UPDATED", tabId: details.tabId, pageUrl: url });
+  },
+  { urls: ["<all_urls>"] }
+);
+
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (info.url && !info.url.startsWith("chrome")) {
+    if (isWebTabUrl(info.url)) lastWebTabId = tabId;
+    store.setTabUrl(tabId, info.url);
+    if (tab.title) tabTitles.set(tabId, tab.title);
+  }
+  if (info.status === "complete" && tab.url) {
+    updateBadge(tabId);
+    broadcast({ type: "VIDEOS_UPDATED", tabId, pageUrl: tab.url });
+  }
+});
+
+chrome.tabs.onActivated.addListener(async (info) => {
+  try {
+    const tab = await chrome.tabs.get(info.tabId);
+    if (tab.url) {
+      if (isWebTabUrl(tab.url)) lastWebTabId = info.tabId;
+      store.setTabUrl(info.tabId, tab.url);
+      updateBadge(info.tabId);
+      broadcast({ type: "VIDEOS_UPDATED", tabId: info.tabId, pageUrl: tab.url });
+    }
+  } catch {
+    /* ignore */
+  }
+});
+
+async function findTabByPageUrl(pageUrl) {
+  if (!pageUrl) return null;
+  let target;
+  try {
+    target = new URL(pageUrl);
+  } catch {
+    return null;
+  }
+  const tabs = await chrome.tabs.query({});
+  for (const t of tabs) {
+    if (!t.url || !isWebTabUrl(t.url)) continue;
+    try {
+      const u = new URL(t.url);
+      if (u.origin === target.origin && u.pathname === target.pathname) return t.id;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function exportTasksPayload() {
+  return {
+    format: "vdm-active-tasks",
+    version: 1,
+    exportedAt: Date.now(),
+    tasks: engine.listActive().map(taskSnapshot),
+  };
+}
+
+async function importTasksPayload(data, opts = {}) {
+  await loadSettings();
+  const swVersion = chrome.runtime.getManifest().version;
+  const payload = data && typeof data === "object" ? data : {};
+  const embedded = payload._importOpts || {};
+  const tasks = Array.isArray(payload?.tasks) ? payload.tasks : Array.isArray(payload) ? payload : [];
+
+  const importFsaKey = String(opts.importFsaKey || embedded.importFsaKey || "").trim();
+  const importFsaLabel = String(opts.importFsaLabel || embedded.importFsaLabel || "").trim();
+
+  VDM.diag(`IMPORT 開始（背景 v${swVersion}）`,
+    `任務數=${tasks.length} importFsaKey=${importFsaKey || "(無)"} label=${importFsaLabel || "-"} ` +
+    `opts.mode=${opts.segmentPathMode || "-"} opts.custom=${opts.customSubfolder || "-"}`);
+
+  if (!tasks.length) return { error: "匯入檔沒有任務", swVersion };
+
+  // handle 由 panel 寫入瀏覽器同源共享 IndexedDB，這裡只認 key。
+  // 先確認 key 對應的資料夾在 offscreen（實際寫檔處）真的可寫，避免靜默存到設定路徑。
+  if (importFsaKey) {
+    if (typeof VDM.verifyImportFsaHandleViaOffscreen === "function") {
+      const verify = await VDM.verifyImportFsaHandleViaOffscreen(importFsaKey);
+      VDM.diag("驗證導入資料夾（offscreen）",
+        `ok=${!!verify?.ok} name=${verify?.name || "-"} perm=${verify?.permission || "-"} err=${verify?.error || "-"}`);
+      if (!verify?.ok) {
+        return {
+          error:
+            verify?.error ||
+            "導入資料夾尚未就緒，請重新點「選擇資料夾」後再確認導入。",
+          swVersion,
+        };
+      }
+    } else {
+      const handle = await VDM.fsaGetImportHandle(importFsaKey);
+      VDM.diag("驗證導入資料夾（IDB）", `found=${!!handle} name=${handle?.name || "-"}`);
+      if (!handle) {
+        return { error: "找不到導入資料夾授權，請重新點「選擇資料夾」後再導入。", swVersion };
+      }
+    }
+  }
+  const mode =
+    importFsaKey || opts.segmentPathMode === "custom" || embedded.segmentPathMode === "custom"
+      ? "custom"
+      : "default";
+  const customSubfolder = VDM.normalizeOptionalSubPath(
+    opts.customSubfolder ?? embedded.customSubfolder ?? ""
+  );
+  const subfolder =
+    importFsaKey
+      ? ""
+      : mode === "custom"
+        ? customSubfolder
+        : VDM.normalizeOptionalSubPath(VDM.downloadSubfolder);
+
+  VDM.diag("IMPORT 路徑決策",
+    `mode=${mode} subfolder=${subfolder || "(根)"} downloadSubfolder設定=${VDM.downloadSubfolder || "(空)"}`);
+
+  // 既有作用中任務（依網址索引），重新導入時直接更新其路徑，而非略過
+  const activeByUrl = new Map();
+  for (const t of engine.listActive()) {
+    activeByUrl.set(VDM.normalizeUrl(t.video?.url || ""), t);
+  }
+  let imported = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  for (const snap of tasks) {
+    if (!snap?.video?.url) {
+      skipped++;
+      continue;
+    }
+    const norm = VDM.normalizeUrl(snap.video.url);
+    const segmentDir = VDM.buildTaskSegmentDirWithSub(snap.fileName, subfolder);
+
+    const existing = activeByUrl.get(norm);
+    if (existing) {
+      // 重新導入：更新既有任務的路徑並重置進度（重點：才不會卡在「沒有可匯入的任務」）
+      existing.importFsaKey = importFsaKey;
+      if (importFsaKey) delete existing.segmentSubfolder;
+      else existing.segmentSubfolder = subfolder;
+      existing.segmentDir = segmentDir;
+      existing.status = "paused";
+      existing.downloaded = 0;
+      existing.fetched = 0;
+      existing.merged = 0;
+      existing.downloadProgress = 0;
+      existing.mergeProgress = 0;
+      existing.progress = 0;
+      existing.total = 0;
+      existing.error = "已更新路徑，可點「繼續」接續下載";
+      const pathHint = importFsaKey ? `${importFsaLabel || "指定資料夾"}/${segmentDir}` : segmentDir;
+      existing.activity = `已重新導入 → ${pathHint}`;
+      VDM.diag("更新既有任務路徑",
+        `id=${existing.id} name=${existing.fileName} importFsaKey=${importFsaKey || "(無)"} segmentDir=${segmentDir}`);
+      updated++;
+      continue;
+    }
+
+    activeByUrl.set(norm, true);
+    const clean = {
+      ...snap,
+      video: VDM.sanitizeTaskVideo(snap.video),
+      status: "paused",
+      importFsaKey,
+      segmentSubfolder: importFsaKey ? undefined : subfolder,
+      segmentDir,
+      downloaded: 0,
+      fetched: 0,
+      merged: 0,
+      downloadProgress: 0,
+      mergeProgress: 0,
+      progress: 0,
+      total: 0,
+      error: "已匯入，可點「繼續」接續下載",
+    };
+    const pathHint = importFsaKey ? `${importFsaLabel || "指定資料夾"}/${segmentDir}` : segmentDir;
+    clean.activity = `已匯入 → ${pathHint}`;
+    if (!clean.id) clean.id = VDM.uid();
+    if (!engine.importTask(clean)) {
+      VDM.diag("匯入任務失敗（engine.importTask 回 false）", `name=${snap.fileName} status=${snap.status}`);
+      skipped++;
+      continue;
+    }
+    VDM.diag("新增匯入任務",
+      `id=${clean.id} name=${clean.fileName} importFsaKey=${importFsaKey || "(無)"} segmentDir=${segmentDir}`);
+    imported++;
+  }
+
+  const handled = imported + updated;
+  if (!handled) return { error: "沒有可匯入的任務（檔案內任務無效）", swVersion };
+  await persistTasksNow();
+  const pathLabel = importFsaKey
+    ? `${importFsaLabel || "指定資料夾"}/*`
+    : subfolder || "（根資料夾）";
+  await pushLog("info",
+    `已處理 ${handled} 個任務（新增 ${imported}、更新 ${updated}、略過 ${skipped}），片段路徑：${pathLabel}`);
+  VDM.diag("IMPORT 完成",
+    `新增=${imported} 更新=${updated} 略過=${skipped} 回傳importFsaKey=${importFsaKey || "(無)"}`);
+  return {
+    ok: true,
+    imported: handled,
+    added: imported,
+    updated,
+    skipped,
+    segmentSubfolder: subfolder,
+    importFsaKey,
+    segmentPathMode: mode,
+    swVersion,
+  };
+}
+
+async function bulkTaskAction(action, taskIds = []) {
+  const ids = [...new Set(taskIds)].filter((id) => engine.tasks.has(id));
+  if (!ids.length) return { error: "沒有可操作的任務" };
+
+  await loadSettings();
+  let done = 0;
+  const errors = [];
+
+  for (const taskId of ids) {
+    try {
+      if (action === "pause") {
+        cancelAutoRetry(taskId);
+        if (engine.pause(taskId)) {
+          const pausedTask = engine.tasks.get(taskId);
+          if (pausedTask) handleTaskProgress(pausedTask);
+          done++;
+        }
+      } else if (action === "cancel") {
+        cancelAutoRetry(taskId);
+        engine.cancel(taskId);
+        done++;
+      } else if (action === "resume") {
+        const t = engine.tasks.get(taskId);
+        if (!t || t.status !== "paused") continue;
+        const newTabId = await findTabByPageUrl(t.video?.pageUrl);
+        if (newTabId) {
+          t.video.tabId = newTabId;
+          prepareVideoForDownload(t.video, t.video.pageUrl);
+        }
+        await setDownloadHeaderRule(t.video?.referer || t.video?.pageUrl || "");
+        if (await engine.resume(taskId, handleTaskProgress)) done++;
+      } else if (action === "retry") {
+        const res = await retryDownloadTask(taskId);
+        if (res.ok) done++;
+        else if (res.error) errors.push(res.error);
+      }
+    } catch (e) {
+      errors.push(e.message || String(e));
+    }
+  }
+
+  persistTasksNow().catch(() => {});
+  if (!done) return { error: errors[0] || "批量操作失敗" };
+  return { ok: true, count: done, errors: errors.length ? errors : undefined };
+}
+
+async function retryDownloadTask(taskId) {
+  const t = engine.tasks.get(taskId);
+  if (!t || !["paused", "failed"].includes(t.status)) {
+    return { error: "此任務無法從頭下載" };
+  }
+
+  const newTabId = await findTabByPageUrl(t.video?.pageUrl);
+  if (newTabId) {
+    t.video.tabId = newTabId;
+    prepareVideoForDownload(t.video, t.video.pageUrl);
+  }
+
+  await setDownloadHeaderRule(t.video.referer || t.video.pageUrl || "");
+  const ok = await engine.retry(taskId, handleTaskProgress);
+  if (!ok) return { error: "從頭下載失敗" };
+  await pushLog("info", `從頭下載：${t.fileName}`);
+  return { ok: true, task: t };
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  store.clearTab(tabId);
+  tabTitles.delete(tabId);
+  tabPosterBest.delete(tabId);
+  store.persist();
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  handleMessage(msg, sender)
+    .then(sendResponse)
+    .catch(async (e) => {
+      await pushLog("error", "背景處理失敗", e.message || String(e));
+      sendResponse({ error: e.message || String(e) });
+    });
+  return true;
+});
+
+async function handleMessage(msg, sender) {
+  await initPromise;
+  const tabId = msg.tabId ?? sender.tab?.id;
+
+  switch (msg.type) {
+    case "GET_SW_VERSION":
+      return { swVersion: chrome.runtime.getManifest().version, importCapable: true };
+    case "SNIFF_URL": {
+      const tid = sender.tab?.id;
+      if (!tid || !msg.url) return { ok: false };
+      const pageUrl = msg.pageUrl || sender.tab?.url || store.getTabUrl(tid);
+      store.setTabUrl(tid, pageUrl);
+      await handleSniff(msg.url, tid, pageUrl, pageUrl);
+      return { ok: true };
+    }
+    case "SNIFF_POSTER": {
+      const tid = sender.tab?.id;
+      if (!tid || !msg.url) return { ok: false };
+      const pageUrl = msg.pageUrl || sender.tab?.url || store.getTabUrl(tid);
+      handlePosterSniff(msg.url, tid, pageUrl, { trusted: !!msg.trusted });
+      return { ok: true };
+    }
+    case "GET_VIDEOS": {
+      const resolved = await resolveTargetTabId(msg.tabId);
+      const tid = resolved.tabId;
+      const pageUrl = resolved.pageUrl || msg.pageUrl || "";
+      const pageTitle = tid ? await resolvePageTitle(tid, pageUrl) : "";
+      const videos = tid ? enrichVideoTitles(store.getForTab(tid), pageTitle) : [];
+      return { videos, pageUrl, tabId: tid };
+    }
+    case "GET_ACTIVE_TASKS": {
+      const tasks = engine.listActive().map(taskSnapshot);
+      return {
+        tasks,
+        stats: {
+          total: tasks.length,
+          running: engine.runningCount,
+          queued: engine.waitQueue.length,
+          maxConcurrent: VDM.clampConcurrentTasks(VDM.maxConcurrentTasks),
+        },
+      };
+    }
+    case "GET_COMPLETED_TASKS": {
+      const { vdmCompleted = [] } = await chrome.storage.local.get("vdmCompleted");
+      return { tasks: vdmCompleted };
+    }
+    case "CLEAR_COMPLETED": {
+      await chrome.storage.local.set({ vdmCompleted: [] });
+      broadcast({ type: "COMPLETED_UPDATED" });
+      return { ok: true };
+    }
+    case "GET_SETTINGS": {
+      await loadSettings();
+      return {
+        maxConnections: VDM.maxConnections,
+        maxConcurrentTasks: VDM.maxConcurrentTasks,
+        useDiskCache: VDM.useDiskCache,
+        downloadSubfolder: VDM.downloadSubfolder,
+        segmentCacheDir: VDM.segmentCacheDir,
+        segmentsOnly: VDM.segmentsOnly,
+        openInTab: VDM.openInTab,
+        diskCacheAvailable: VDM.opfsAvailable(),
+      };
+    }
+    case "OPEN_MANAGER_TAB": {
+      const resolved = await resolveTargetTabId(msg.tabId);
+      const mode = msg.mode === "pc" ? "pc" : "download";
+      return openManagerTab(resolved.tabId || lastWebTabId, mode);
+    }
+    case "OPEN_BATCH_SEARCH": {
+      const resolved = await resolveTargetTabId(msg.tabId ?? msg.sourceTabId);
+      return openBatchSearchTab(resolved.tabId || lastWebTabId);
+    }
+    case "DETECT_SITE_SEARCH": {
+      const tid = msg.sourceTabId ?? (await resolveTargetTabId(msg.tabId)).tabId;
+      if (!tid) return { error: "找不到來源分頁" };
+      const config = await detectSiteSearchFromTab(tid);
+      const sampleUrl = VDM.buildSearchUrl(config, "SAMPLE-001");
+      return { config, sampleUrl };
+    }
+    case "START_BATCH_SEARCH": {
+      if (batchSearchRunning) return { error: "批量搜索進行中" };
+      const tid = msg.sourceTabId ?? (await resolveTargetTabId(msg.tabId)).tabId;
+      if (!tid) return { error: "找不到來源分頁" };
+      const queries = Array.isArray(msg.queries) ? msg.queries.filter(Boolean) : [];
+      if (!queries.length) return { error: "列表為空" };
+      runBatchSearchJob({
+        sourceTabId: tid,
+        queries,
+        openFirstResult: msg.openFirstResult !== false,
+        delayMs: Math.max(0, Number(msg.delayMs) || 600),
+      }).catch(async (e) => {
+        await pushLog("error", "批量搜索失敗", e.message || String(e));
+        broadcastBatchProgress({ status: "finished", summary: e.message || "批量搜索失敗" });
+        batchSearchRunning = false;
+      });
+      return { ok: true, count: queries.length };
+    }
+    case "STOP_BATCH_SEARCH": {
+      batchSearchCancel = true;
+      return { ok: true };
+    }
+    case "SET_MANAGER_SOURCE": {
+      if (msg.tabId) await setManagerSourceTab(msg.tabId);
+      return { ok: true, tabId: msg.tabId || null };
+    }
+    case "USE_RECENT_TAB": {
+      const tid = lastWebTabId || (await chrome.storage.session.get("vdmManagerTabId")).vdmManagerTabId;
+      if (!tid) return { error: "找不到可監視的網頁分頁，請先切換到影片分頁" };
+      await setManagerSourceTab(tid);
+      const pageUrl = await resolvePageUrl(tid);
+      return { tabId: tid, pageUrl };
+    }
+    case "OPEN_DOWNLOAD_FOLDER": {
+      await openDownloadSubfolder(msg.subfolder);
+      return { ok: true };
+    }
+    case "SET_SETTINGS": {
+      const { vdmSettings: prev = {} } = await chrome.storage.local.get("vdmSettings");
+      const next = {
+        ...prev,
+        maxConnections: VDM.clampConnections(msg.maxConnections ?? prev.maxConnections),
+        maxConcurrentTasks: VDM.clampConcurrentTasks(
+          msg.maxConcurrentTasks ?? prev.maxConcurrentTasks
+        ),
+        useDiskCache: msg.useDiskCache !== undefined ? !!msg.useDiskCache : prev.useDiskCache !== false,
+        downloadSubfolder: VDM.normalizeOptionalSubPath(
+          msg.downloadSubfolder ?? prev.downloadSubfolder ?? ""
+        ),
+        segmentCacheDir: String(msg.segmentCacheDir ?? prev.segmentCacheDir ?? "vdm-cache").trim() || "vdm-cache",
+        segmentsOnly: msg.segmentsOnly !== undefined ? !!msg.segmentsOnly : prev.segmentsOnly !== false,
+        openInTab: msg.openInTab !== undefined ? !!msg.openInTab : !!prev.openInTab,
+      };
+      await chrome.storage.local.set({ vdmSettings: next });
+      await loadSettings();
+      await applyUiMode();
+      engine.pumpQueue();
+      return { ok: true, ...next, diskCacheAvailable: VDM.opfsAvailable() };
+    }
+    case "GET_TAB_GROUP_INFO": {
+      const resolved = await resolveTargetTabId(msg.tabId);
+      return getTabGroupInfo(resolved.tabId);
+    }
+    case "START_GROUP_DOWNLOADS": {
+      await loadSettings();
+      const resolved = await resolveTargetTabId(msg.tabId);
+      if (!resolved.tabId) {
+        return { error: "找不到目前分頁" };
+      }
+      let collected;
+      if (Array.isArray(msg.items) && msg.items.length) {
+        collected = { items: msg.items };
+      } else {
+        collected = await collectGroupDownloadItems(resolved.tabId, {
+          resniff: msg.resniff !== false && !shouldPushToPc(msg),
+        });
+      }
+      if (collected.error) return { error: collected.error };
+      if (!collected.items?.length) {
+        return { error: "群組內沒有偵測到可下載影片（請先在各分頁播放影片）" };
+      }
+      if (msg.coverOnly) {
+        const result = await downloadCoversForItems(collected.items);
+        if (!result.count) return { error: "群組內找不到封面或下載失敗" };
+        await pushLog("info", `群組封面已下載 ${result.count}/${result.total} 個`);
+        return { coverOnly: true, count: result.count, total: result.total };
+      }
+      if (shouldPushToPc(msg)) {
+        try {
+          const started = await pushDownloadItemsToPc(collected.items);
+          if (!started.length) return { error: "群組內影片無法送至 PC 版" };
+          return { tasks: started, count: started.length };
+        } catch (err) {
+          const msgErr = err?.message || String(err);
+          await pushLog("error", `群組送至 PC 失敗：${msgErr}`);
+          return { error: msgErr };
+        }
+      }
+      const started = await enqueueDownloadTasks(collected.items);
+      if (!started.length) {
+        return { error: "群組內影片已在下載中或無法加入" };
+      }
+      await pushLog("info", `群組下載：已加入 ${started.length} 個任務（各分頁最高畫質）`);
+      return { tasks: started, count: started.length };
+    }
+    case "START_DOWNLOADS": {
+      await loadSettings();
+      const resolved = await resolveTargetTabId(msg.tabId);
+      const tid = resolved.tabId;
+      if (!tid) {
+        await pushLog("error", "找不到目前分頁");
+        return { error: "找不到目前分頁" };
+      }
+      const pageUrl = resolved.pageUrl || (await resolvePageUrl(tid));
+      const pageTitle = await resolvePageTitle(tid, pageUrl);
+      const ids = new Set(msg.videoIds || []);
+      const videos = enrichVideoTitles(
+        store.getForTab(tid).filter((v) => ids.has(v.id)),
+        pageTitle
+      );
+      if (!videos.length) {
+        const msgErr = `找不到選取的影片（分頁 ${tid}，共 ${store.getForTab(tid).length} 個可下載）`;
+        await pushLog("error", msgErr, `pageUrl=${pageUrl}`);
+        return { error: msgErr };
+      }
+      const items = videos.map((video) => ({ video, tabId: tid, pageUrl, pageTitle }));
+      if (msg.coverOnly) {
+        const result = await downloadCoversForItems(items);
+        if (!result.count) return { error: "找不到封面或下載失敗" };
+        await pushLog("info", `封面已下載 ${result.count}/${result.total} 個`);
+        return { coverOnly: true, count: result.count, total: result.total };
+      }
+      if (shouldPushToPc(msg)) {
+        try {
+          const started = await pushDownloadItemsToPc(items);
+          if (!started.length) return { error: "選取的影片無法送至 PC 版" };
+          return { tasks: started };
+        } catch (err) {
+          const msgErr = err?.message || String(err);
+          await pushLog("error", `送至 PC 失敗：${msgErr}`);
+          return { error: msgErr };
+        }
+      }
+      const started = await enqueueDownloadTasks(items);
+      if (!started.length) {
+        return { error: "選取的影片已在下載中或無法加入" };
+      }
+      await pushLog("info", `已加入 ${started.length} 個下載任務`);
+      return { tasks: started };
+    }
+    case "START_COVER_DOWNLOADS": {
+      await loadSettings();
+      const resolved = await resolveTargetTabId(msg.tabId);
+      const tid = resolved.tabId;
+      if (!tid) return { error: "找不到目前分頁" };
+      const pageUrl = resolved.pageUrl || (await resolvePageUrl(tid));
+      const pageTitle = await resolvePageTitle(tid, pageUrl);
+      const ids = new Set(msg.videoIds || []);
+      const videos = enrichVideoTitles(
+        store.getForTab(tid).filter((v) => ids.has(v.id)),
+        pageTitle
+      );
+      if (!videos.length) return { error: "找不到選取的影片" };
+      const items = videos.map((video) => ({ video, tabId: tid, pageUrl, pageTitle }));
+      const result = await downloadCoversForItems(items);
+      if (!result.count) return { error: "找不到封面或下載失敗" };
+      await pushLog("info", `封面已下載 ${result.count}/${result.total} 個`);
+      return { coverOnly: true, count: result.count, total: result.total };
+    }
+    case "START_GROUP_COVER_DOWNLOADS": {
+      await loadSettings();
+      const resolved = await resolveTargetTabId(msg.tabId);
+      if (!resolved.tabId) return { error: "找不到目前分頁" };
+      const collected = await collectGroupDownloadItems(resolved.tabId);
+      if (collected.error) return { error: collected.error };
+      if (!collected.items?.length) {
+        return { error: "群組內沒有偵測到可下載影片" };
+      }
+      const result = await downloadCoversForItems(collected.items);
+      if (!result.count) return { error: "群組內找不到封面或下載失敗" };
+      await pushLog("info", `群組封面已下載 ${result.count}/${result.total} 個`);
+      return { coverOnly: true, count: result.count, total: result.total };
+    }
+    case "PAUSE_TASK": {
+      cancelAutoRetry(msg.taskId);
+      const ok = engine.pause(msg.taskId);
+      const pausedTask = engine.tasks.get(msg.taskId);
+      if (pausedTask) handleTaskProgress(pausedTask);
+      persistTasksNow().catch(() => {});
+      if (!ok) return { error: "此任務目前無法暫停" };
+      return { ok: true };
+    }
+    case "BULK_TASK_ACTION":
+      return bulkTaskAction(msg.action, msg.taskIds);
+    case "EXPORT_ACTIVE_TASKS":
+      return { data: exportTasksPayload() };
+    case "IMPORT_ACTIVE_TASKS":
+      return importTasksPayload(msg.data, {
+        segmentPathMode: msg.segmentPathMode,
+        customSubfolder: msg.customSubfolder,
+        importFsaKey: msg.importFsaKey,
+        importFsaLabel: msg.importFsaLabel,
+      });
+    case "RESUME_TASK": {
+      cancelAutoRetry(msg.taskId);
+      await loadSettings();
+      const t = engine.tasks.get(msg.taskId);
+      if (!t) return { error: "找不到任務" };
+      const newTabId = await findTabByPageUrl(t.video?.pageUrl);
+      if (newTabId) {
+        t.video.tabId = newTabId;
+        prepareVideoForDownload(t.video, t.video.pageUrl);
+      }
+      await setDownloadHeaderRule(t.video?.referer || t.video?.pageUrl || "");
+      if (!(await engine.resume(msg.taskId, handleTaskProgress))) {
+        return { error: "此任務無法繼續" };
+      }
+      return { ok: true };
+    }
+    case "CANCEL_TASK":
+      cancelAutoRetry(msg.taskId);
+      engine.cancel(msg.taskId);
+      persistTasksNow().catch(() => {});
+      return { ok: true };
+    case "RETRY_TASK":
+      cancelAutoRetry(msg.taskId);
+      return retryDownloadTask(msg.taskId);
+    case "GET_CURRENT_TAB": {
+      return resolveTargetTabId(msg.tabId);
+    }
+    case "GET_LOGS": {
+      const { vdmLogs = [] } = await chrome.storage.local.get("vdmLogs");
+      return { logs: vdmLogs };
+    }
+    case "CLEAR_LOGS": {
+      await chrome.storage.local.set({ vdmLogs: [] });
+      return { ok: true };
+    }
+    case "GET_FSA_STATUS":
+      return VDM.fsaGetStatus();
+    case "CLEAR_FSA_HANDLE":
+      await VDM.fsaClearHandle();
+      return { ok: true };
+    case "GET_OPFS_CACHE_INFO":
+      return VDM.opfsCacheInfo();
+    case "CLEAR_OPFS_CACHE": {
+      const res = await VDM.opfsClearAllCache();
+      await pushLog("info", `已清除 Chrome 內部 OPFS 暫存（${res.removed} 個任務目錄）`);
+      return { ok: true, ...res };
+    }
+    default:
+      return { error: `未知指令：${msg.type || "(無)"}` };
+  }
+}
+
+chrome.alarms.create("vdm-keepalive", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== "vdm-keepalive") return;
+  if (engine.listActive().length > 0) {
+    broadcast({ type: "TASK_TICK" });
+    persistTasksNow().catch(() => {});
+    touchRuntimeHeartbeat(null).catch(() => {});
+  }
+  checkMemoryPressureLog();
+});
+
+let _memWarnedAt = 0;
+function checkMemoryPressureLog() {
+  try {
+    const m = self.performance?.memory;
+    if (!m || !m.jsHeapSizeLimit) return;
+    const usedMB = Math.round(m.usedJSHeapSize / 1048576);
+    const limitMB = Math.round(m.jsHeapSizeLimit / 1048576);
+    const ratio = m.usedJSHeapSize / m.jsHeapSizeLimit;
+    if (ratio < 0.70) { _memWarnedAt = 0; return; }
+    const now = Date.now();
+    if (now - _memWarnedAt < 60_000) return; // 每分鐘最多警告一次
+    _memWarnedAt = now;
+    pushLog("warn",
+      `記憶體使用率偏高：${usedMB} MB / ${limitMB} MB（${Math.round(ratio * 100)}%）`,
+      "建議開啟磁碟暫存（設定 → HLS 片段寫入磁碟暫存）或降低並行數"
+    );
+  } catch {
+    /* performance.memory 在此環境不可用 */
+  }
+}
+
+if (chrome.runtime.onSuspend) {
+  chrome.runtime.onSuspend.addListener(() => {
+    markCleanShutdown().catch(() => {});
+    persistTasksNow().catch(() => {});
+  });
+}
+
+/* ── 全局未捕捉錯誤記錄 ── */
+self.addEventListener("error", (e) => {
+  pushLog("error", `[SW 崩潰] ${e.message || "未知錯誤"}`,
+    `${e.filename || ""}:${e.lineno || 0}  ${e.error?.stack || ""}`);
+});
+self.addEventListener("unhandledrejection", (e) => {
+  const msg = e.reason?.message || String(e.reason || "未知 rejection");
+  const stack = e.reason?.stack || "";
+  pushLog("error", `[SW 未處理 Promise] ${msg}`, stack.slice(0, 300));
+});
+
+/* ── OPFS 串流存檔：攔截 chrome.downloads 對 /opfs-serve/{videoId} 的請求 ──
+ * chrome.downloads.download({ url: 'chrome-extension://[id]/opfs-serve/[videoId]' })
+ * 會觸發此 fetch handler，SW 直接把 OPFS merged.mp4 以串流回應，
+ * 完全不需要橋接分頁（避免 renderer 崩潰），也不需要把檔案讀進 RAM。
+ */
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (!url.pathname.startsWith("/opfs-serve/")) return;
+  event.respondWith(
+    (async () => {
+      await initPromise;
+      const videoId = decodeURIComponent(
+        url.pathname.replace("/opfs-serve/", "").split("/")[0]
+      );
+      try {
+        const dir = await VDM.opfsTaskDir(videoId);
+        const fh = await dir.getFileHandle("merged.mp4");
+        const file = await fh.getFile();
+        return new Response(file.stream(), {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(file.size),
+            "Content-Disposition": "attachment",
+          },
+        });
+      } catch (err) {
+        await pushLog("error", "[OPFS serve] 找不到 merged.mp4", err.message || String(err));
+        return new Response(null, { status: 404 });
+      }
+    })()
+  );
+});

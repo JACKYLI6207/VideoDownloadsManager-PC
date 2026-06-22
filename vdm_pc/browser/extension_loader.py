@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 
 VDM_PC_EXTENSION_ID = "anokolhjgbidjccbgmahcgdagmmdoddi"
+VDM_CHROME_EXTENSION_ID = "ggdnpjnbnfkefamaimapljjpfefmjjpf"
 
 _EXT_ID_RE = re.compile(r"[a-p]{32}")
 _CRX_URL = (
@@ -146,6 +147,8 @@ def extension_id_from_path(path: Path) -> str:
                 return _chrome_id_from_manifest_key(key)
             except (ValueError, TypeError):
                 pass
+        if data.get("description") in {"VDM_Bundled", "VDM_Chrome"}:
+            return VDM_CHROME_EXTENSION_ID
         if data.get("description") == "VDM_PC":
             return VDM_PC_EXTENSION_ID
     raise ValueError(f"無法解析擴充 ID：{path}")
