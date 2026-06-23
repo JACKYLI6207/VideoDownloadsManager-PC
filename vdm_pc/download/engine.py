@@ -62,6 +62,40 @@ class DownloadEngine(QObject):
         return max(1, int(self.settings.get("maxConnections") or 3))
     def _max_concurrent_tasks(self) -> int:
         return max(1, int(self.settings.get("maxConcurrentTasks") or 2))
+
+    def _max_concurrent_merges(self) -> int:
+        return max(1, int(self.settings.get("mergeMaxConcurrentTasks") or 1))
+
+    def _active_worker_counts(self) -> tuple[int, int]:
+        merges = downloads = 0
+        for tid in self._worker_active:
+            task = self.tasks.get(tid)
+            if not task:
+                continue
+            if self.is_local_merge(task):
+                merges += 1
+            else:
+                downloads += 1
+        return merges, downloads
+
+    def _can_start_task(self, task_id: str) -> bool:
+        task = self.tasks.get(task_id)
+        if not task or task_id in self._paused or task_id in self._worker_active:
+            return False
+        merges, downloads = self._active_worker_counts()
+        if self.is_local_merge(task):
+            return merges < self._max_concurrent_merges()
+        return downloads < self._max_concurrent_tasks()
+
+    def _pop_startable_task(self) -> str | None:
+        for i, task_id in enumerate(self._wait_queue):
+            if task_id not in self.tasks or task_id in self._paused:
+                continue
+            if task_id in self._worker_active:
+                continue
+            if self._can_start_task(task_id):
+                return self._wait_queue.pop(i)
+        return None
     def _restore_persisted(self) -> None:
         for task in persist.load_active():
             self._reconcile_task_cache(task)
@@ -293,10 +327,6 @@ class DownloadEngine(QObject):
     def _run_task(self, task_id: str) -> None:
         my_gen = self._task_gen.get(task_id, 0)
         try:
-            with self._lock:
-                if task_id in self._worker_active:
-                    return
-                self._worker_active.add(task_id)
             try:
                 task = self.tasks.get(task_id)
                 if not task or not self._alive(task_id, my_gen) or task_id in self._paused:
@@ -393,13 +423,12 @@ class DownloadEngine(QObject):
         timer.start()
     def _pump(self) -> None:
         with self._lock:
-            while self._running < self._max_concurrent_tasks() and self._wait_queue:
-                task_id = self._wait_queue.pop(0)
-                if task_id not in self.tasks or task_id in self._paused:
-                    continue
-                if task_id in self._worker_active:
-                    self._wait_queue.append(task_id)
+            max_workers = self._max_concurrent_tasks() + self._max_concurrent_merges()
+            while self._running < max_workers:
+                task_id = self._pop_startable_task()
+                if not task_id:
                     break
+                self._worker_active.add(task_id)
                 self._running += 1
                 threading.Thread(target=self._run_task, args=(task_id,), daemon=True).start()
     def _build_headers(self, video: VideoMeta, target_url: str) -> dict[str, str]:
@@ -679,7 +708,19 @@ class DownloadEngine(QObject):
             task.progress = pct
             self._emit(task.id)
 
-        merge_segments_to_mp4(segments, out, on_progress=on_ffmpeg)
+        def on_fallback(msg: str) -> None:
+            self.log_bus.push(
+                "warn",
+                f"直接合併失敗，改用暫存串接：{task.file_name}",
+                msg,
+            )
+
+        merge_segments_to_mp4(
+            segments,
+            out,
+            on_progress=on_ffmpeg,
+            on_fallback=on_fallback,
+        )
         task.merge_progress = 100
         task.progress = 100
 

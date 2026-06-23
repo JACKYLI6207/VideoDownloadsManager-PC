@@ -28,9 +28,26 @@
       this.controllers = new Map();
       this.paused = new Set();
       this.waitQueue = [];
-      this.runningCount = 0;
+      // 名額以 token 計（每次 start() 取得一個 token）。runningCount 由 token 數推得，
+      // 而非靠 start() 的 .finally 手動 -1。如此即使某個 start() 因卡死（無逾時、
+      // 不理 abort 的 fetchM3u8 / 分頁內 fetch 等）永不結算，仍能由看門狗回收名額。
+      this.runningTokens = new Set();
+      this.taskToken = new Map();
+      this._tokenSeq = 0;
       this.activeRuns = new Set();
       this.runGen = new Map();
+    }
+
+    get runningCount() {
+      return this.runningTokens.size;
+    }
+    set runningCount(_v) {
+      /* 保留相容：名額改由 runningTokens 管理，忽略外部直接賦值 */
+    }
+
+    _freeSlot(taskId, token) {
+      this.runningTokens.delete(token);
+      if (this.taskToken.get(taskId) === token) this.taskToken.delete(taskId);
     }
 
     _bumpRun(taskId) {
@@ -72,12 +89,14 @@
 
     pumpQueue() {
       const max = VDM.clampConcurrentTasks(VDM.maxConcurrentTasks);
-      while (this.runningCount < max && this.waitQueue.length) {
+      while (this.runningTokens.size < max && this.waitQueue.length) {
         const item = this.waitQueue.shift();
         if (!this.tasks.has(item.task.id)) continue;
-        this.runningCount++;
+        const token = ++this._tokenSeq;
+        this.runningTokens.add(token);
+        this.taskToken.set(item.task.id, token);
         this.start(item.task, item.onProgress).finally(() => {
-          this.runningCount = Math.max(0, this.runningCount - 1);
+          this._freeSlot(item.task.id, token);
           this.pumpQueue();
         });
       }
@@ -213,6 +232,39 @@
       }
       const ctrl = this.controllers.get(taskId);
       if (ctrl && !ctrl.signal.aborted) ctrl.abort();
+      // 立即回收名額並補位（即使該任務的 start() 卡死也不影響其他任務）
+      this.activeRuns.delete(taskId);
+      const token = this.taskToken.get(taskId);
+      if (token != null) this._freeSlot(taskId, token);
+      this.pumpQueue();
+      return true;
+    }
+
+    /**
+     * 看門狗強制停滯暫停：偵測到「下載中」卻長時間零進度（卡死的 worker），
+     * 中止其連線讓 start() 結算、回收並行名額；不設 _userPaused，背景會自動繼續。
+     */
+    stallPause(taskId, msg) {
+      const t = this.tasks.get(taskId);
+      if (!t || t.status !== "downloading") return false;
+      delete t._userPaused;
+      this.paused.add(taskId);
+      t.status = "paused";
+      t.speed = 0;
+      t.error = "";
+      VDM.setTaskActivity(t, msg || "連線停滯，將自動繼續…");
+      this._bumpRun(taskId);
+      if (typeof VDM.fsaAbortOffscreenFetches === "function") {
+        VDM.fsaAbortOffscreenFetches(taskId);
+      }
+      const ctrl = this.controllers.get(taskId);
+      if (ctrl && !ctrl.signal.aborted) ctrl.abort();
+      // 立即釋放名額並補位：不等待可能卡死、不理會 abort 的 start() 結算。
+      // 該卡死的 start() 之後若真的結算，_freeSlot 對已移除 token 是 no-op，不會誤扣。
+      this.activeRuns.delete(taskId);
+      const token = this.taskToken.get(taskId);
+      if (token != null) this._freeSlot(taskId, token);
+      this.pumpQueue();
       return true;
     }
 
@@ -265,6 +317,7 @@
     cancel(taskId) {
       this.waitQueue = this.waitQueue.filter((item) => item.task.id !== taskId);
       this.paused.delete(taskId);
+      this._bumpRun(taskId);
       const ctrl = this.controllers.get(taskId);
       if (ctrl) ctrl.abort();
       const t = this.tasks.get(taskId);
@@ -276,6 +329,11 @@
       }
       this.tasks.delete(taskId);
       this.controllers.delete(taskId);
+      // 立即回收名額並補位，不等待可能卡死的 start() 結算
+      this.activeRuns.delete(taskId);
+      const token = this.taskToken.get(taskId);
+      if (token != null) this._freeSlot(taskId, token);
+      this.pumpQueue();
     }
 
     async retry(taskId, onProgress) {
@@ -432,6 +490,9 @@
           this._abortToPaused(task, "下載未完成，將自動繼續");
         }
       } catch (err) {
+        // 此 start() 的 run 已被取代（看門狗 stallPause + 自動繼續會 bumpRun）：
+        // 不可再改動共享 task 狀態，否則會把新的一輪誤踩成 paused/failed。
+        if (!this._runAlive(task.id, runGen)) return;
         if (task.status === "paused" || this.paused.has(task.id) || task._userPaused) {
           task.status = "paused";
           task.speed = 0;
@@ -465,26 +526,65 @@
       return status === 403 || status === 401 || status === 429;
     }
 
+    /**
+     * 建立「任務 signal + 逾時」合併中止器。
+     * 連線停滯（socket 未斷但無資料）時，原生 fetch / arrayBuffer 不會自行結束，
+     * 會讓 worker 永久卡在 await → start() 永不結算 → runningCount 名額被佔死。
+     * 逾時觸發即中止該片段請求，讓任務轉為暫停並由背景自動繼續，回收並行名額。
+     */
+    _linkedTimeoutSignal(signal, timeoutMs) {
+      const ctrl = new AbortController();
+      let timedOut = false;
+      const onAbort = () => ctrl.abort();
+      if (signal) {
+        if (signal.aborted) ctrl.abort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
+      const timer = setTimeout(() => {
+        timedOut = true;
+        ctrl.abort();
+      }, Math.max(1000, timeoutMs || 0));
+      return {
+        signal: ctrl.signal,
+        timedOut: () => timedOut,
+        cleanup: () => {
+          clearTimeout(timer);
+          signal?.removeEventListener?.("abort", onAbort);
+        },
+      };
+    }
+
     async _fetchSegmentBody(video, url, signal) {
       const headers = await VDM.buildHeaders(video, url, { forBackground: true });
-      const res = await fetch(url, { headers, signal });
-      if (res.ok) {
-        const buf = await res.arrayBuffer();
-        if (!buf?.byteLength) throw new Error("空片段（0B）");
-        if (buf.byteLength < 376) throw new Error(`片段過小 (${buf.byteLength}B)`);
-        return buf;
+      const link = this._linkedTimeoutSignal(signal, VDM.SEGMENT_STALL_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { headers, signal: link.signal });
+        if (res.ok) {
+          const buf = await res.arrayBuffer();
+          if (!buf?.byteLength) throw new Error("空片段（0B）");
+          if (buf.byteLength < 376) throw new Error(`片段過小 (${buf.byteLength}B)`);
+          return buf;
+        }
+        if (this._isBanStatus(res.status)) {
+          VDM.markFetchBlocked(video, res.status);
+          throw new Error(VDM.fetchBlockedError(video));
+        }
+        if (video.tabId && !VDM.isFetchBlocked(video)) {
+          const buf = await VDM.fetchBytesInPage(video.tabId, url, video);
+          if (!buf?.byteLength) throw new Error("空片段（0B）");
+          if (buf.byteLength < 376) throw new Error(`片段過小 (${buf.byteLength}B)`);
+          return buf;
+        }
+        throw new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        // 逾時中止（非使用者暫停）：轉為可被自動繼續判定的網路錯誤
+        if (link.timedOut() && !signal?.aborted) {
+          throw new Error("片段下載逾時（連線停滯，將自動繼續）");
+        }
+        throw err;
+      } finally {
+        link.cleanup();
       }
-      if (this._isBanStatus(res.status)) {
-        VDM.markFetchBlocked(video, res.status);
-        throw new Error(VDM.fetchBlockedError(video));
-      }
-      if (video.tabId && !VDM.isFetchBlocked(video)) {
-        const buf = await VDM.fetchBytesInPage(video.tabId, url, video);
-        if (!buf?.byteLength) throw new Error("空片段（0B）");
-        if (buf.byteLength < 376) throw new Error(`片段過小 (${buf.byteLength}B)`);
-        return buf;
-      }
-      throw new Error(`HTTP ${res.status}`);
     }
 
     async _fetchSegment(video, url, signal) {
@@ -617,7 +717,9 @@
         onProgress(task);
       };
 
-      const copyHalt = () => halt || copyErr;
+      // 含 signal/paused：暫停或看門狗中止時，複製迴圈立即跳出，
+      // 避免 worker 永久卡在 backpressure busy-loop 等待無回應的 offscreen 複製。
+      const copyHalt = () => halt || copyErr || signal?.aborted || this.paused.has(task.id);
 
       const pumpCopy = () => {
         while (copyQueue.length && copyPending < copySlots && !copyHalt()) {
@@ -647,7 +749,12 @@
       };
 
       const drainCopies = async () => {
-        while ((copyQueue.length > 0 || copyPending > 0) && !copyErr) {
+        while (
+          (copyQueue.length > 0 || copyPending > 0) &&
+          !copyErr &&
+          !signal?.aborted &&
+          !this.paused.has(task.id)
+        ) {
           pumpCopy();
           await new Promise((r) => setTimeout(r, 40));
         }

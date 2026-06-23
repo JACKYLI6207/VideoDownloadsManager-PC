@@ -2252,15 +2252,56 @@ async function handleMessage(msg, sender) {
 }
 
 chrome.alarms.create("vdm-keepalive", { periodInMinutes: 1 });
+// 專責停滯看門狗：30 秒一次，比 1 分鐘 keepalive 更快回收被卡死任務佔住的並行名額。
+chrome.alarms.create("vdm-stall-watch", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "vdm-stall-watch") {
+    if (engine.listActive().length > 0) checkStalledTasks();
+    return;
+  }
   if (alarm.name !== "vdm-keepalive") return;
   if (engine.listActive().length > 0) {
     broadcast({ type: "TASK_TICK" });
     persistTasksNow().catch(() => {});
     touchRuntimeHeartbeat(null).catch(() => {});
+    checkStalledTasks();
   }
   checkMemoryPressureLog();
 });
+
+/**
+ * 停滯看門狗（後備防線）：
+ * 若任務狀態為「下載中」卻長時間毫無進度（worker 卡死、offscreen 無回應等），
+ * 它仍佔住 engine.runningCount 名額卻不下載 → 久了名額被佔滿、實際下載歸零，
+ * 但 UI 仍顯示「執行 N」。這裡偵測到後強制停滯暫停以回收名額，並觸發自動繼續。
+ */
+const _stallStamps = new Map(); // taskId -> { sig, at }
+function checkStalledTasks() {
+  const now = Date.now();
+  const stallMs = VDM.TASK_STALL_TIMEOUT_MS || 70_000;
+  const liveIds = new Set();
+  for (const t of engine.listActive()) {
+    if (t.status !== "downloading") continue;
+    liveIds.add(t.id);
+    const sig = (t.downloaded || 0) + (t.fetched || 0) + (t.merged || 0);
+    const prev = _stallStamps.get(t.id);
+    if (!prev || sig > prev.sig) {
+      _stallStamps.set(t.id, { sig, at: now });
+      continue;
+    }
+    if (now - prev.at >= stallMs) {
+      const idleSec = Math.round((now - prev.at) / 1000);
+      if (engine.stallPause(t.id, "連線停滯，自動重試中…")) {
+        _stallStamps.delete(t.id);
+        pushLog("warn", `偵測到停滯，自動重試：${t.fileName}`, `逾 ${idleSec} 秒無進度`).catch(() => {});
+        handleTaskProgress(t);
+      }
+    }
+  }
+  for (const id of [..._stallStamps.keys()]) {
+    if (!liveIds.has(id)) _stallStamps.delete(id);
+  }
+}
 
 let _memWarnedAt = 0;
 function checkMemoryPressureLog() {

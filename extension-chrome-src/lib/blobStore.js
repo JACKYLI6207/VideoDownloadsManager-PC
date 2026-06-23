@@ -177,9 +177,22 @@
     });
   };
 
+  // offscreen 請求逾時：避免 offscreen 無回應時 SW 端 promise 永久卡住，
+  // 連帶讓下載 worker / start() 永不結算、佔死 runningCount 名額。
+  const OFFSCREEN_REQUEST_TIMEOUT_MS = 60_000;
+
   function fsaOffscreenRequest(payload) {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`offscreen 無回應逾時（${payload?.action || "FSA"}）`));
+      }, OFFSCREEN_REQUEST_TIMEOUT_MS);
       chrome.runtime.sendMessage({ type: "OFFSCREEN_FSA", ...payload }, (res) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
           return;

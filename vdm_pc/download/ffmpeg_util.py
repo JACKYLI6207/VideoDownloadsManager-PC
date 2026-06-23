@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -46,12 +47,44 @@ def concat_ts_to_mp4(
     *,
     on_progress: Callable[[float], None] | None = None,
     duration_sec: float = 0.0,
+    total_bytes: int = 0,
 ) -> None:
     """用 concat demuxer 無損封裝成 MP4（隱藏 CMD 黑窗，可回報進度）。"""
     if not segment_paths:
         raise RuntimeError("沒有片段可合併")
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
     list_file = out_mp4.with_suffix(".txt")
+    stop_poll = threading.Event()
+    last_pct = -1.0
+
+    def emit_progress(pct: float) -> None:
+        nonlocal last_pct
+        if not on_progress:
+            return
+        pct = min(100.0, max(0.0, pct))
+        if pct <= last_pct:
+            return
+        last_pct = pct
+        on_progress(pct)
+
+    def poll_output_bytes() -> None:
+        while not stop_poll.wait(0.5):
+            if total_bytes <= 0:
+                continue
+            try:
+                size = out_mp4.stat().st_size if out_mp4.is_file() else 0
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            emit_progress(min(99.0, size / total_bytes * 100.0))
+
+    use_byte_poll = bool(on_progress and duration_sec <= 0 and total_bytes > 0)
+    poller: threading.Thread | None = None
+    if use_byte_poll:
+        poller = threading.Thread(target=poll_output_bytes, daemon=True)
+        poller.start()
+
     try:
         lines = []
         for p in segment_paths:
@@ -79,8 +112,7 @@ def concat_ts_to_mp4(
             "-nostats",
             str(out_mp4),
         ]
-        if on_progress:
-            on_progress(0.0)
+        emit_progress(1.0)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -100,13 +132,15 @@ def concat_ts_to_mp4(
                     elapsed_us = int(line.split("=", 1)[1])
                 except ValueError:
                     continue
-                if on_progress and duration_sec > 0:
+                if duration_sec > 0:
                     pct = min(100.0, max(0.0, (elapsed_us / 1_000_000) / duration_sec * 100))
-                    on_progress(pct)
+                    emit_progress(pct)
         rc = proc.wait()
         if rc != 0:
             raise RuntimeError(f"FFmpeg 合併失敗（exit {rc}）")
-        if on_progress:
-            on_progress(100.0)
+        emit_progress(100.0)
     finally:
+        stop_poll.set()
+        if poller:
+            poller.join(timeout=2.0)
         list_file.unlink(missing_ok=True)

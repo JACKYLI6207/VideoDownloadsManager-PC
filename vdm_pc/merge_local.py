@@ -26,7 +26,6 @@ def collect_segments(folder: Path) -> list[Path]:
     if not folder.is_dir():
         raise RuntimeError(f"資料夾不存在：{folder}")
 
-    # 有編號片段時一律用全部片段（略過可能不完整的 merged.ts）
     numbered = _collect_numbered(folder)
     if numbered:
         return numbered
@@ -99,33 +98,33 @@ def folder_stable_for_merge(folder: Path, idle_seconds: float = 15.0) -> bool:
     return (time.time() - newest) >= idle_seconds
 
 
-def merge_segments_to_mp4(
+def _total_segment_bytes(segments: list[Path]) -> int:
+    total = 0
+    for seg in segments:
+        try:
+            total += seg.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def estimate_total_duration_sec(segments: list[Path]) -> float:
+    """以首段時長 × 段數估算總時長（供 FFmpeg 進度條）。"""
+    if not segments:
+        return 0.0
+    first = probe_duration_sec(segments[0])
+    if first > 0 and len(segments) > 1:
+        return first * len(segments)
+    return first
+
+
+def _merge_via_temp_ts(
     segments: list[Path],
     out_mp4: Path,
     *,
-    on_progress: Callable[[float], None] | None = None,
+    report: Callable[[float], None],
 ) -> None:
-    """先二進位串接全部片段，再 FFmpeg 封裝 MP4（進度 0–94% 串接，94–100% 封裝）。"""
-    if not segments:
-        raise RuntimeError("沒有片段可合併")
-
-    out_mp4.parent.mkdir(parents=True, exist_ok=True)
-
-    def report(pct: float) -> None:
-        if on_progress:
-            on_progress(min(100.0, max(0.0, pct)))
-
-    if len(segments) == 1:
-        report(0.0)
-        duration = probe_duration_sec(segments[0])
-
-        def on_ffmpeg(pct: float) -> None:
-            report(94.0 + pct * 0.06)
-
-        concat_ts_to_mp4(segments, out_mp4, on_progress=on_ffmpeg, duration_sec=duration)
-        report(100.0)
-        return
-
+    """舊路徑：Python 串接暫存 .ts 再封裝（fallback）。"""
     temp_ts = out_mp4.with_suffix(".merge.tmp.ts")
     total = len(segments)
     try:
@@ -141,7 +140,70 @@ def merge_segments_to_mp4(
         def on_ffmpeg(pct: float) -> None:
             report(94.0 + pct * 0.06)
 
-        concat_ts_to_mp4([temp_ts], out_mp4, on_progress=on_ffmpeg, duration_sec=duration)
+        concat_ts_to_mp4(
+            [temp_ts],
+            out_mp4,
+            on_progress=on_ffmpeg,
+            duration_sec=duration,
+            total_bytes=temp_ts.stat().st_size if temp_ts.is_file() else 0,
+        )
         report(100.0)
     finally:
         temp_ts.unlink(missing_ok=True)
+
+
+def merge_segments_to_mp4(
+    segments: list[Path],
+    out_mp4: Path,
+    *,
+    on_progress: Callable[[float], None] | None = None,
+    on_fallback: Callable[[str], None] | None = None,
+) -> str:
+    """
+    合併片段為 MP4。
+    優先 FFmpeg 直接 concat；失敗時 fallback 暫存串接。
+    進度：有時長用時間；無時長用輸出檔大小 / 輸入總位元組估算。
+    """
+    if not segments:
+        raise RuntimeError("沒有片段可合併")
+
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    total_bytes = _total_segment_bytes(segments)
+
+    def report(pct: float) -> None:
+        if on_progress:
+            on_progress(min(100.0, max(0.0, pct)))
+
+    duration = estimate_total_duration_sec(segments)
+
+    def on_ffmpeg(pct: float) -> None:
+        report(pct)
+
+    if len(segments) == 1:
+        report(0.0)
+        concat_ts_to_mp4(
+            segments,
+            out_mp4,
+            on_progress=on_ffmpeg,
+            duration_sec=duration,
+            total_bytes=total_bytes,
+        )
+        report(100.0)
+        return "direct"
+
+    try:
+        report(1.0)
+        concat_ts_to_mp4(
+            segments,
+            out_mp4,
+            on_progress=on_ffmpeg,
+            duration_sec=duration,
+            total_bytes=total_bytes,
+        )
+        report(100.0)
+        return "direct"
+    except Exception as exc:
+        if on_fallback:
+            on_fallback(str(exc))
+        _merge_via_temp_ts(segments, out_mp4, report=report)
+        return "temp"

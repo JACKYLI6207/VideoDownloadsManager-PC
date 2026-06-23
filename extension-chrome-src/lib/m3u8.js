@@ -78,19 +78,24 @@
     }
 
     const headers = await VDM.buildHeaders(video, url, { forBackground: true });
+    const timeoutMs = VDM.SEGMENT_STALL_TIMEOUT_MS || 45_000;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { headers });
+      const res = await fetch(url, { headers, signal: ac.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
       return VDM.parseM3u8(text, url);
     } catch (err) {
-      const msg = err.message || String(err);
+      const msg = err?.name === "AbortError" ? "逾時（連線停滯）" : err.message || String(err);
       VDM.log("error", "M3U8 下載失敗", msg);
       throw new Error(
         video.tabId
           ? `M3U8 失敗：${msg}（請確認影片分頁仍開啟且正在播放）`
           : `M3U8 失敗：${msg}`
       );
+    } finally {
+      clearTimeout(timer);
     }
   };
 })();

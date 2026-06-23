@@ -5,6 +5,38 @@ VDM.USER_AGENT = typeof navigator !== "undefined" ? navigator.userAgent : "Mozil
 VDM.maxConnections = 3;
 VDM.maxConcurrentTasks = 2;
 
+// 單片段 fetch 逾時：連線停滯（socket 未斷但無資料）時自我中止，避免 worker 永久卡死佔住並行名額。
+VDM.SEGMENT_STALL_TIMEOUT_MS = 45_000;
+// 任務級停滯看門狗：「下載中」但逾此時間毫無進度 → 強制中止重排（後備防線）。
+VDM.TASK_STALL_TIMEOUT_MS = 70_000;
+// 分頁內 fetch（executeScript / content script）單次逾時：避免分頁無回應時永久卡住。
+VDM.PAGE_FETCH_TIMEOUT_MS = 25_000;
+
+/** 競賽逾時：即使底層 promise 永不結算，也保證在 ms 後 reject，讓呼叫端能繼續。 */
+VDM.raceTimeout = (promise, ms, label = "操作") =>
+  new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      reject(new Error(`${label}逾時（${Math.round(ms / 1000)}秒無回應）`));
+    }, Math.max(1000, ms || 0));
+    Promise.resolve(promise).then(
+      (v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+
 /**
  * 跨情境 DEBUG 記錄器（背景 / offscreen / 面板皆可呼叫）。
  * 直接寫入 chrome.storage.local 的 vdmLogs，會顯示在「日誌」分頁。
@@ -65,37 +97,45 @@ VDM.getGlobalSegmentLimit = () => {
 
 VDM._segmentSlots = { inUse: 0, waiters: [] };
 
+/**
+ * 喚醒等待者：迴圈跳過已中止（settled）的死等待者，確保被釋放的名額
+ * 一定交給「活著」的等待者，不會被死等待者吃掉而讓後面的人永久卡住。
+ */
+VDM._pumpSegmentSlots = () => {
+  const s = VDM._segmentSlots;
+  while (s.waiters.length && s.inUse < VDM.getGlobalSegmentLimit()) {
+    const w = s.waiters.shift();
+    if (w.settled) continue; // 已被 abort，跳過
+    w.settled = true;
+    s.inUse++;
+    w.grant();
+  }
+};
+
 VDM.acquireSegmentSlot = (signal) =>
   new Promise((resolve, reject) => {
-    const tryAcquire = () => {
-      if (signal?.aborted) {
-        reject(new Error("cancelled"));
-        return;
-      }
-      if (VDM._segmentSlots.inUse < VDM.getGlobalSegmentLimit()) {
-        VDM._segmentSlots.inUse++;
-        resolve();
-        return;
-      }
-      VDM._segmentSlots.waiters.push(tryAcquire);
-    };
-    const onAbort = () => {
-      const i = VDM._segmentSlots.waiters.indexOf(tryAcquire);
-      if (i >= 0) VDM._segmentSlots.waiters.splice(i, 1);
-      reject(new Error("cancelled"));
-    };
     if (signal?.aborted) {
       reject(new Error("cancelled"));
       return;
     }
+    const waiter = { settled: false };
+    const onAbort = () => {
+      if (waiter.settled) return; // 已取得名額或已結束 → 不影響
+      waiter.settled = true;
+      reject(new Error("cancelled"));
+    };
+    waiter.grant = () => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    };
     signal?.addEventListener?.("abort", onAbort, { once: true });
-    tryAcquire();
+    VDM._segmentSlots.waiters.push(waiter);
+    VDM._pumpSegmentSlots();
   });
 
 VDM.releaseSegmentSlot = () => {
   VDM._segmentSlots.inUse = Math.max(0, VDM._segmentSlots.inUse - 1);
-  const next = VDM._segmentSlots.waiters.shift();
-  if (next) next();
+  VDM._pumpSegmentSlots();
 };
 
 VDM.uid = () => Math.random().toString(36).slice(2, 14);
@@ -370,37 +410,54 @@ VDM._pageFetch = async (tabId, url, video) => {
     }
   }
 
+  const perFetchMs = VDM.PAGE_FETCH_TIMEOUT_MS || 25_000;
+  // 外層競賽逾時要比「每個 referer 候選 × 單次逾時」略長，正常多重試不會被誤切，
+  // 只有在分頁/注入完全無回應時才會跳出，避免 SW 永久 await。
+  const outerMs = perFetchMs * Math.max(1, refererList.length) + 15_000;
+
   if (chrome.scripting?.executeScript) {
     try {
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [0] },
-        world: "MAIN",
-        func: async (fetchUrl, refs, hdrs) => {
-          let last = "";
-          for (const ref of refs) {
-            const headers = { ...(hdrs || {}) };
-            if (ref) headers.Referer = ref;
-            try {
-              const res = await fetch(fetchUrl, { credentials: "include", headers });
-              if (res.ok) {
-                const buf = await res.arrayBuffer();
-                return {
-                  ok: true,
-                  status: res.status,
-                  via: "main-world",
-                  referer: ref,
-                  bytes: Array.from(new Uint8Array(buf)),
-                };
+      const [{ result }] = await VDM.raceTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId, frameIds: [0] },
+          world: "MAIN",
+          func: async (fetchUrl, refs, hdrs, timeoutMs) => {
+            let last = "";
+            for (const ref of refs) {
+              const headers = { ...(hdrs || {}) };
+              if (ref) headers.Referer = ref;
+              const ac = new AbortController();
+              const timer = setTimeout(() => ac.abort(), timeoutMs);
+              try {
+                const res = await fetch(fetchUrl, {
+                  credentials: "include",
+                  headers,
+                  signal: ac.signal,
+                });
+                if (res.ok) {
+                  const buf = await res.arrayBuffer();
+                  return {
+                    ok: true,
+                    status: res.status,
+                    via: "main-world",
+                    referer: ref,
+                    bytes: Array.from(new Uint8Array(buf)),
+                  };
+                }
+                last = `HTTP ${res.status} (ref=${ref || "-"})`;
+              } catch (e) {
+                last = `${e.name === "AbortError" ? "逾時" : e.message || e} (ref=${ref || "-"})`;
+              } finally {
+                clearTimeout(timer);
               }
-              last = `HTTP ${res.status} (ref=${ref || "-"})`;
-            } catch (e) {
-              last = `${e.message || e} (ref=${ref || "-"})`;
             }
-          }
-          return { ok: false, status: 0, via: "main-world", error: last || "fail" };
-        },
-        args: [url, refererList, extraHeaders],
-      });
+            return { ok: false, status: 0, via: "main-world", error: last || "fail" };
+          },
+          args: [url, refererList, extraHeaders, perFetchMs],
+        }),
+        outerMs,
+        "分頁注入下載"
+      );
       if (result?.ok) {
         VDM.log("info", "MAIN world fetch 成功", `${result.via} ${short}`);
         return result;
@@ -412,10 +469,14 @@ VDM._pageFetch = async (tabId, url, video) => {
   }
 
   try {
-    const res = await chrome.tabs.sendMessage(
-      tabId,
-      { type: "PAGE_FETCH", url, refererList, headers: extraHeaders },
-      { frameId: 0 }
+    const res = await VDM.raceTimeout(
+      chrome.tabs.sendMessage(
+        tabId,
+        { type: "PAGE_FETCH", url, refererList, headers: extraHeaders },
+        { frameId: 0 }
+      ),
+      outerMs,
+      "content script 下載"
     );
     if (res?.ok) {
       VDM.log("info", "content-script fetch 成功", `${res.via || "cs"} ${short}`);

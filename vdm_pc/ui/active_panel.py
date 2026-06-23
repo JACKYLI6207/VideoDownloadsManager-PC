@@ -185,6 +185,12 @@ class ActivePanel(QWidget):
         self.delete_segments_cb.toggled.connect(self._on_scan_settings_changed)
         delete_row.addWidget(self.delete_segments_cb)
         delete_row.addStretch(1)
+        delete_row.addWidget(QLabel("同時合併數："))
+        self.merge_concurrent_spin = QSpinBox()
+        self.merge_concurrent_spin.setRange(1, 8)
+        self.merge_concurrent_spin.setValue(int(self.settings.get("mergeMaxConcurrentTasks") or 1))
+        self.merge_concurrent_spin.valueChanged.connect(self._on_merge_concurrent_changed)
+        delete_row.addWidget(self.merge_concurrent_spin)
         root.addLayout(delete_row)
 
         seg_row = QHBoxLayout()
@@ -271,6 +277,11 @@ class ActivePanel(QWidget):
         if path:
             self.segment_root_input.setText(path)
             self._save_scan_settings()
+
+    def _on_merge_concurrent_changed(self, value: int) -> None:
+        self.settings["mergeMaxConcurrentTasks"] = value
+        save_settings(self.settings)
+        self.engine.update_settings(self.settings)
 
     def _on_scan_settings_changed(self, *_args) -> None:
         self._save_scan_settings()
