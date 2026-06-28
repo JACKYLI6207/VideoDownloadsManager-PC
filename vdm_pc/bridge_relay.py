@@ -6,3 +6,4 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 class BridgeRelay(QObject):
     tasks_received = pyqtSignal(list)
+    names_received = pyqtSignal(list)

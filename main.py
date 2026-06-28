@@ -98,11 +98,15 @@ def main() -> int:
 
     relay.tasks_received.connect(window.browser_panel.tasks_received.emit)
 
+    relay.names_received.connect(window.browser_panel.names_received.emit)
+
 
 
     bridge = PcBridgeServer(
 
         on_tasks=lambda tasks: relay.tasks_received.emit(tasks),
+
+        on_names=lambda names: relay.names_received.emit(names),
 
     )
 

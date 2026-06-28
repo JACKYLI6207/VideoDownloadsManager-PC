@@ -9,8 +9,12 @@
 <body class="pc-mode">
   <div class="app-shell">
     <header class="app-header">
-      <h1>⬇ Video Downloads Manager</h1>
-      <button class="btn-popout" id="openBatchSearch" type="button" title="在新分頁開啟批量搜索（可選 TXT 列表）">批量搜索 ↗</button>
+      <h1>⬇ Video Downloads Manager <span id="extVersion" class="ext-version"></span></h1>
+      <div class="header-actions">
+        <button class="btn-popout" id="extractAllSearchNames" type="button" title="提取本頁搜索結果名稱並推送至 PC 瀏覽器分頁">提取全部搜索結果名稱</button>
+        <button class="btn-popout" id="openAllSearchResults" type="button" title="將本頁搜索結果全部以群組分頁開啟">開啟全部搜索結果</button>
+        <button class="btn-popout" id="openBatchSearch" type="button" title="在新分頁開啟批量搜索（可選 TXT 列表）">批量搜索 ↗</button>
+      </div>
     </header>
 
     <div id="toast" class="toast" hidden></div>

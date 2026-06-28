@@ -18,6 +18,8 @@ const PC_IDS = new Set([
   "coverDownloadBtn",
   "groupCoverDownloadBtn",
   "openBatchSearch",
+  "openAllSearchResults",
+  "extractAllSearchNames",
   "reinjectBtn",
 ]);
 
@@ -488,6 +490,18 @@ async function withButton(btn, busyText, run) {
   }
 }
 
+async function resolveActiveSourceTabId() {
+  let tabId = currentTabId;
+  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (activeTab?.id && activeTab.url && !activeTab.url.startsWith("chrome-extension")) {
+    tabId = activeTab.id;
+  } else {
+    await refreshContext();
+    tabId = currentTabId;
+  }
+  return tabId;
+}
+
 $("#downloadBtn")?.addEventListener("click", async (e) => {
   e.preventDefault();
   const ids = [...selected];
@@ -575,6 +589,39 @@ $("#openBatchSearch")?.addEventListener("click", (e) => {
     });
 });
 
+$("#openAllSearchResults")?.addEventListener("click", async (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const btn = $("#openAllSearchResults");
+  try {
+    await withButton(btn, "開啟中…", async () => {
+      const tabId = await resolveActiveSourceTabId();
+      const res = await api("OPEN_ALL_SEARCH_RESULTS", { tabId });
+      const msg = res.warning
+        ? `已開啟 ${res.count} 個分頁（${res.warning}）`
+        : `已開啟 ${res.count} 個搜索結果分頁${res.groupId != null ? `（群組 #${res.groupId}）` : ""}`;
+      showToast(msg, res.warning ? "error" : "info");
+    });
+  } catch (err) {
+    showToast(err.message || "開啟失敗", "error");
+  }
+});
+
+$("#extractAllSearchNames")?.addEventListener("click", async (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const btn = $("#extractAllSearchNames");
+  try {
+    await withButton(btn, "推送中…", async () => {
+      const tabId = await resolveActiveSourceTabId();
+      const res = await api("PUSH_SEARCH_RESULT_NAMES", { tabId });
+      showToast(`已推送 ${res.count} 個名稱至 PC「瀏覽器」分頁`, "info");
+    });
+  } catch (err) {
+    showToast(err.message || "推送失敗", "error");
+  }
+});
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "VIDEOS_UPDATED") {
     loadVideos();
@@ -652,6 +699,12 @@ document.addEventListener("vdm-mode-change", (e) => {
 });
 
 (async function init() {
+  try {
+    const verEl = document.getElementById("pc-extVersion") || document.getElementById("extVersion");
+    if (verEl) verEl.textContent = `v${chrome.runtime.getManifest().version}`;
+  } catch {
+    /* ignore */
+  }
   try {
     await loadVideos();
   } catch (err) {

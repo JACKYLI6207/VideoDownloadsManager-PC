@@ -9,7 +9,7 @@
 <body>
   <div class="app-shell">
     <header class="app-header">
-      <h1>⬇ Video Downloads Manager</h1>
+      <h1>⬇ Video Downloads Manager <span id="pc-extVersion" class="ext-version"></span></h1>
     </header>
 
     <nav class="mode-tabs">
@@ -24,7 +24,11 @@
         <div class="toolbar">
           <label><input type="checkbox" id="pc-selectAll" /> 全選</label>
           <span id="pc-detectedCount">0 個</span>
-          <button class="btn-popout" id="pc-openBatchSearch" type="button" title="在新分頁開啟批量搜索">批量搜索 ↗</button>
+          <div class="toolbar-actions">
+            <button class="btn-popout" id="pc-extractAllSearchNames" type="button" title="提取本頁搜索結果名稱並推送至 PC 瀏覽器分頁">提取全部搜索結果名稱</button>
+            <button class="btn-popout" id="pc-openAllSearchResults" type="button" title="將本頁搜索結果全部以群組分頁開啟">開啟全部搜索結果</button>
+            <button class="btn-popout" id="pc-openBatchSearch" type="button" title="在新分頁開啟批量搜索">批量搜索 ↗</button>
+          </div>
         </div>
         <p id="pc-sourceTabLabel" class="source-tab-label" hidden></p>
         <div id="pc-detectedList" class="list"></div>

@@ -298,80 +298,137 @@ async function detectSiteSearchFromTab(tabId) {
   return result;
 }
 
+async function injectSiteSearch(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      files: ["lib/siteSearch.js"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function pickFirstResultFromTab(tabId) {
   if (!tabId || !chrome.scripting?.executeScript) return "";
   try {
+    await injectSiteSearch(tabId);
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [0] },
-      func: () => {
-        const bad =
-          /\/search(?:\/|\?|$)|\/login|\/register|\/signup|\/tags?(?:\/|\?|$)|\/categories?(?:\/|\?|$)|\/actress|\/actor|\/genre|\/ranking|\/contact|\/about|\/help|#$|javascript:/i;
-        const abs = (u) => {
-          try {
-            return new URL(u, location.href).href;
-          } catch {
-            return "";
-          }
-        };
-        const sameOrigin = (u) => {
-          try {
-            return new URL(u).origin === location.origin;
-          } catch {
-            return false;
-          }
-        };
-        const skipContainer = (el) =>
-          !!el?.closest?.("header, nav, footer, .header, .nav, .footer, .menu, .navbar, .sidebar");
-        const selectors = [
-          ".video-item a[href]",
-          ".item a[href]",
-          ".grid-item a[href]",
-          ".search-item a[href]",
-          "a.title[href]",
-          "a.video-link[href]",
-          ".box a[href]",
-          "div.item a[href]",
-          'a[href*="/video/"]',
-          'a[href*="/v/"]',
-          'a[href*="/detail/"]',
-          'a[href*="/movie/"]',
-          'a[href*="/?v="]',
-          'a[href*="/video?id="]',
-        ];
-        for (const sel of selectors) {
-          for (const a of document.querySelectorAll(sel)) {
-            if (skipContainer(a)) continue;
-            const href = abs(a.getAttribute("href") || a.href);
-            if (!href || !sameOrigin(href)) continue;
-            if (bad.test(href)) continue;
-            return href;
-          }
-        }
-        const main = document.querySelector("main, #main, .main, #content, .content, .search-result, .results");
-        const scope = main || document.body;
-        let best = "";
-        let bestScore = 0;
-        for (const a of scope.querySelectorAll("a[href]")) {
-          if (skipContainer(a)) continue;
-          const href = abs(a.getAttribute("href") || a.href);
-          if (!href || !sameOrigin(href)) continue;
-          if (bad.test(href)) continue;
-          const text = (a.textContent || "").trim();
-          let score = 1;
-          if (text.length >= 3) score += 2;
-          if (/\/video|\/v\/|\/detail|\/movie/i.test(href)) score += 5;
-          if (score > bestScore) {
-            bestScore = score;
-            best = href;
-          }
-        }
-        return best;
-      },
+      func: () => VDM.pickFirstResultUrl(),
     });
     return result || "";
   } catch {
     return "";
   }
+}
+
+async function collectResultUrlsFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return [];
+  try {
+    await injectSiteSearch(tabId);
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: () => VDM.collectResultUrls(),
+    });
+    return Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+async function collectResultNamesFromTab(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return [];
+  try {
+    await injectSiteSearch(tabId);
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: () => VDM.collectResultNames(),
+    });
+    return Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+async function extractAllSearchResultNames(sourceTabId) {
+  const tab = await chrome.tabs.get(sourceTabId);
+  if (!isWebTabUrl(tab.url)) return { error: "來源分頁不是有效網頁" };
+
+  const names = await collectResultNamesFromTab(sourceTabId);
+  if (!names.length) {
+    return {
+      error: VDM.isLikelySearchResultsUrl(tab.url)
+        ? "此頁找不到搜索結果名稱"
+        : "此頁找不到搜索結果名稱，請先切到含 div.item 列表的搜索結果頁",
+    };
+  }
+
+  return { ok: true, names, count: names.length, pageUrl: tab.url || "" };
+}
+
+async function pushSearchResultNamesToPc(sourceTabId) {
+  const extracted = await extractAllSearchResultNames(sourceTabId);
+  if (extracted.error) return extracted;
+  if (!VDM.isPcMode()) return { error: "非 PC 模式" };
+  try {
+    const pushed = await VDM.pushNamesToPc(extracted.names);
+    await pushLog("info", `已推送 ${extracted.count} 個搜索結果名稱至 PC 瀏覽器`);
+    return { ok: true, count: extracted.count, pushed: pushed?.count ?? extracted.count };
+  } catch (err) {
+    const msgErr = err?.message || String(err);
+    await pushLog("error", `推送搜索結果名稱失敗：${msgErr}`);
+    return { error: msgErr };
+  }
+}
+
+async function openAllSearchResults(sourceTabId) {
+  const tab = await chrome.tabs.get(sourceTabId);
+  if (!isWebTabUrl(tab.url)) return { error: "來源分頁不是有效網頁" };
+
+  const urls = await collectResultUrlsFromTab(sourceTabId);
+  if (!urls.length) {
+    return {
+      error: VDM.isLikelySearchResultsUrl(tab.url)
+        ? "此頁找不到搜索結果連結"
+        : "此頁找不到搜索結果連結，請先切到含 div.item 列表的搜索結果頁",
+    };
+  }
+
+  const windowId = tab.windowId;
+  let groupId = tab.groupId != null && tab.groupId !== -1 ? tab.groupId : null;
+  const newTabIds = [];
+
+  for (const url of urls) {
+    const created = await chrome.tabs.create({ url, active: false, windowId });
+    newTabIds.push(created.id);
+  }
+
+  try {
+    if (groupId) {
+      for (let i = 0; i < newTabIds.length; i += 8) {
+        await chrome.tabs.group({ tabIds: newTabIds.slice(i, i + 8), groupId });
+      }
+    } else {
+      groupId = await chrome.tabs.group({
+        tabIds: [sourceTabId, ...newTabIds],
+        createProperties: { windowId },
+      });
+    }
+  } catch (e) {
+    await pushLog("warn", "搜索結果分頁群組化失敗", e.message || String(e));
+    return {
+      ok: true,
+      count: urls.length,
+      groupId: null,
+      warning: "分頁已開啟，但未能加入群組",
+    };
+  }
+
+  await pushLog("info", `已開啟 ${urls.length} 個搜索結果分頁${groupId != null ? `（群組 #${groupId}）` : ""}`);
+  return { ok: true, count: urls.length, groupId };
 }
 
 async function addTabToGroup(tabId, groupId) {
@@ -1816,6 +1873,18 @@ async function handleMessage(msg, sender) {
     case "OPEN_BATCH_SEARCH": {
       const resolved = await resolveTargetTabId(msg.tabId ?? msg.sourceTabId);
       return openBatchSearchTab(resolved.tabId || lastWebTabId);
+    }
+    case "OPEN_ALL_SEARCH_RESULTS": {
+      const resolved = await resolveTargetTabId(msg.tabId ?? msg.sourceTabId);
+      const tid = resolved.tabId || lastWebTabId;
+      if (!tid) return { error: "找不到來源分頁" };
+      return openAllSearchResults(tid);
+    }
+    case "PUSH_SEARCH_RESULT_NAMES": {
+      const resolved = await resolveTargetTabId(msg.tabId ?? msg.sourceTabId);
+      const tid = resolved.tabId || lastWebTabId;
+      if (!tid) return { error: "找不到來源分頁" };
+      return pushSearchResultNamesToPc(tid);
     }
     case "DETECT_SITE_SEARCH": {
       const tid = msg.sourceTabId ?? (await resolveTargetTabId(msg.tabId)).tabId;

@@ -27,7 +27,7 @@ from vdm_pc.browser.driver import PlaywrightDriver
 from vdm_pc.browser.extension_loader import parse_extension_urls
 from vdm_pc.config import browser_profile_dir
 from vdm_pc.import_tasks import export_payload, import_tasks, normalize_url, parse_import_file
-from vdm_pc.models import DownloadTask, VideoMeta, format_resolution, resolve_quality
+from vdm_pc.models import DownloadTask, VideoMeta, format_resolution, new_id, resolve_quality
 
 
 def _resolution_quality(task: DownloadTask) -> int:
@@ -91,10 +91,25 @@ def _task_from_snap(snap: dict) -> DownloadTask | None:
     return task
 
 
+def _task_from_name(name: str) -> DownloadTask | None:
+    code = str(name or "").strip().upper()
+    if not code:
+        return None
+    video = VideoMeta(url=f"vdm-name-only://{code}", title=code)
+    return DownloadTask(
+        id=new_id(),
+        video=video,
+        file_name=code,
+        status="pending",
+        name_only=True,
+    )
+
+
 class BrowserPanel(QWidget):
     _LIST_ROW_HEIGHT = 42
 
     tasks_received = pyqtSignal(list)
+    names_received = pyqtSignal(list)
 
     def __init__(self, settings: dict, parent=None) -> None:
         super().__init__(parent)
@@ -102,6 +117,7 @@ class BrowserPanel(QWidget):
         self.pending: list[DownloadTask] = []
         self.driver: PlaywrightDriver | None = None
         self.tasks_received.connect(self._ingest_bridge_tasks)
+        self.names_received.connect(self._ingest_bridge_names)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -136,7 +152,8 @@ class BrowserPanel(QWidget):
         left = QFrame()
         left.setObjectName("card")
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("可下載清單"))
+        self.list_title_label = QLabel("可下載清單（0 筆）")
+        left_layout.addWidget(self.list_title_label)
         self.resource_table = QTableWidget(0, 2)
         self.resource_table.setHorizontalHeaderLabels(["影片名稱", "解析度"])
         self.resource_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -154,17 +171,26 @@ class BrowserPanel(QWidget):
         self.resource_table.cellDoubleClicked.connect(self._on_row_double_clicked)
         left_layout.addWidget(self.resource_table, 1)
         btn_row = QHBoxLayout()
-        for label, slot in (
-            ("全部清除", self._clear_all),
-            ("清除", self._clear_one),
-            ("導出", self._export_pending),
-            ("導入", self._import_pending),
-            ("檔名列表匯出", self._export_filename_list),
+        clear_all_btn = QPushButton("全部清除")
+        clear_all_btn.clicked.connect(self._clear_all)
+        clear_one_btn = QPushButton("清除")
+        clear_one_btn.clicked.connect(self._clear_one)
+        self.export_btn = QPushButton("導出")
+        self.export_btn.clicked.connect(self._export_pending)
+        self.import_btn = QPushButton("導入")
+        self.import_btn.clicked.connect(self._import_pending)
+        self.filename_export_btn = QPushButton("檔名列表匯出")
+        self.filename_export_btn.clicked.connect(self._export_filename_list)
+        for btn in (
+            clear_all_btn,
+            clear_one_btn,
+            self.export_btn,
+            self.import_btn,
+            self.filename_export_btn,
         ):
-            btn = QPushButton(label)
-            btn.clicked.connect(slot)
             btn_row.addWidget(btn)
         left_layout.addLayout(btn_row)
+        self._update_list_action_buttons()
         body.addWidget(left, 2)
 
         right = QFrame()
@@ -267,6 +293,41 @@ class BrowserPanel(QWidget):
             added += 1
         if added:
             self._log(f"擴充已加入 {added} 個任務至可下載清單")
+        self._update_list_action_buttons()
+
+    @pyqtSlot(list)
+    def _ingest_bridge_names(self, raw_names: list) -> None:
+        added = 0
+        seen = {_copyable_name(t.file_name).upper() for t in self._list_tasks()}
+        for raw in raw_names:
+            task = _task_from_name(str(raw or ""))
+            if not task:
+                continue
+            key = _copyable_name(task.file_name).upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            self._append_list_item(task)
+            added += 1
+        if added:
+            self._log(f"擴充已推送 {added} 個搜索結果名稱至可下載清單")
+        else:
+            self._log("未加入新名稱（可能皆已存在於清單）")
+        self._update_list_action_buttons()
+
+    def _list_has_name_only(self) -> bool:
+        return any(t.name_only for t in self._list_tasks())
+
+    def _update_list_action_buttons(self) -> None:
+        count = self.resource_table.rowCount()
+        self.list_title_label.setText(f"可下載清單（{count} 筆）")
+        locked = self._list_has_name_only()
+        tip = "搜索結果名稱清單僅支援「檔名列表匯出」；全部清除後可恢復導出/導入"
+        for btn in (self.export_btn, self.import_btn):
+            btn.setEnabled(not locked)
+            btn.setToolTip(tip if locked else "")
+        self.filename_export_btn.setEnabled(True)
+        self.filename_export_btn.setToolTip("")
 
     def _append_list_item(self, task: DownloadTask) -> None:
         sorting = self.resource_table.isSortingEnabled()
@@ -335,6 +396,7 @@ class BrowserPanel(QWidget):
         self.pending.clear()
         self.resource_table.setRowCount(0)
         self._log("已清除可下載清單全部項目")
+        self._update_list_action_buttons()
 
     def _clear_one(self) -> None:
         row = self._selected_row()
@@ -348,8 +410,16 @@ class BrowserPanel(QWidget):
         self.resource_table.removeRow(row)
         self._rebuild_pending()
         self._log(f"已清除：{task.file_name.replace('.mp4', '')}")
+        self._update_list_action_buttons()
 
     def _export_pending(self) -> None:
+        if self._list_has_name_only():
+            QMessageBox.information(
+                self,
+                "導出",
+                "目前為搜索結果名稱清單，請使用「檔名列表匯出」。",
+            )
+            return
         tasks = self._list_tasks()
         if not tasks:
             QMessageBox.information(self, "導出", "可下載清單為空。")
@@ -374,6 +444,13 @@ class BrowserPanel(QWidget):
         QMessageBox.information(self, "匯出完成", f"已匯出 {len(names)} 個檔名至：\n{path}")
 
     def _import_pending(self) -> None:
+        if self._list_has_name_only():
+            QMessageBox.information(
+                self,
+                "導入",
+                "目前清單含搜索結果名稱，請先「全部清除」後再導入。",
+            )
+            return
         path, _ = QFileDialog.getOpenFileName(self, "導入待下載任務", "", "JSON (*.json)")
         if not path:
             return
@@ -399,5 +476,6 @@ class BrowserPanel(QWidget):
                 "導入完成",
                 f"已導入 {added} 個任務（略過 {skipped} 個）",
             )
+            self._update_list_action_buttons()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "導入失敗", str(exc))

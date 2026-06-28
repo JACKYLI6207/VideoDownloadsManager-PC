@@ -149,6 +149,7 @@ class DownloadTask:
     download_folder: str = ""
     source_folder: str = ""
     started_at: float = field(default_factory=time.time)
+    name_only: bool = False
 
     @classmethod
     def create(cls, video: VideoMeta, file_name: str) -> DownloadTask:

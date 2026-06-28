@@ -34,4 +34,29 @@
     }
     return res.json().catch(() => ({}));
   };
+
+  VDM.pushNamesToPc = async function pushNamesToPc(names) {
+    const list = Array.isArray(names) ? names.filter(Boolean) : [];
+    if (!list.length) throw new Error("名稱列表為空");
+    const res = await fetch(`http://127.0.0.1:${PC_BRIDGE_PORT}/push-names`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        format: "vdm-search-names",
+        version: 1,
+        source: "vdm-extension-pc",
+        names: list,
+      }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = await res.text();
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`PC 版未回應（${res.status}）${detail ? `：${detail.slice(0, 80)}` : ""}`);
+    }
+    return res.json().catch(() => ({}));
+  };
 })();

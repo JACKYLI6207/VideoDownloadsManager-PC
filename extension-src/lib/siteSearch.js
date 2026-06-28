@@ -184,11 +184,20 @@ VDM.buildSearchUrl = (config, query) => {
 VDM.isLikelySearchResultsUrl = (url) => {
   try {
     const u = new URL(url);
-    if (/\/search(?:\/|$|\?)/i.test(u.pathname + u.search)) return true;
+    const pathAndSearch = u.pathname + u.search;
+    if (/\/search(?:\/|$|\?)/i.test(pathAndSearch)) return true;
     for (const key of VDM.SEARCH_FIELD_NAMES) {
       const v = u.searchParams.get(key);
       if (v && String(v).trim().length >= 2) return true;
     }
+    // 分頁參數（如 ?page=5）常出現在搜索／列表結果頁
+    if (u.searchParams.has("page") || u.searchParams.has("p")) {
+      if (/\/search|\/tags?\/|\/categories?\/|\/actress|\/actor|\/genre|\/videos?\/|\/cn\/|\/en\/|\/ja\//i.test(u.pathname)) {
+        return true;
+      }
+    }
+    // 路徑分頁：/search/keyword/5
+    if (/\/search\/[^/]+\/\d+\/?$/i.test(u.pathname)) return true;
   } catch {
     /* ignore */
   }
@@ -238,7 +247,7 @@ VDM.parseSearchUrlTemplate = (pageUrl) => {
 
 VDM.searchConfigCacheKey = (origin) => `vdmSearchConfig_${origin}`;
 
-VDM.pickFirstResultUrl = () => {
+VDM._resultLinkContext = () => {
   const bad =
     /\/search(?:\/|\?|$)|\/login|\/register|\/signup|\/tags?(?:\/|\?|$)|\/categories?(?:\/|\?|$)|\/actress|\/actor|\/genre|\/ranking|\/contact|\/about|\/help|#$|javascript:/i;
   const abs = (u) => {
@@ -257,7 +266,6 @@ VDM.pickFirstResultUrl = () => {
   };
   const skipContainer = (el) =>
     !!el?.closest?.("header, nav, footer, .header, .nav, .footer, .menu, .navbar, .sidebar");
-
   const selectors = [
     ".grid a[href]",
     "article a[href]",
@@ -276,35 +284,119 @@ VDM.pickFirstResultUrl = () => {
     'a[href*="/?v="]',
     'a[href*="/video?id="]',
   ];
-
-  for (const sel of selectors) {
-    for (const a of document.querySelectorAll(sel)) {
-      if (skipContainer(a)) continue;
-      const href = abs(a.getAttribute("href") || a.href);
-      if (!href || !sameOrigin(href)) continue;
-      if (bad.test(href)) continue;
-      return href;
-    }
-  }
-
   const main = document.querySelector("main, #main, .main, #content, .content, .search-result, .results");
   const scope = main || document.body;
-  let best = "";
-  let bestScore = 0;
-  for (const a of scope.querySelectorAll("a[href]")) {
-    if (skipContainer(a)) continue;
+  const normalizeHref = (a) => {
+    if (skipContainer(a)) return "";
     const href = abs(a.getAttribute("href") || a.href);
-    if (!href || !sameOrigin(href)) continue;
-    if (bad.test(href)) continue;
+    if (!href || !sameOrigin(href)) return "";
+    if (bad.test(href)) return "";
+    return href;
+  };
+  return { bad, abs, sameOrigin, skipContainer, selectors, scope, normalizeHref };
+};
+
+VDM.collectResultUrls = () => {
+  const { selectors, scope, normalizeHref } = VDM._resultLinkContext();
+  for (const sel of selectors) {
+    const hrefs = [];
+    const seen = new Set();
+    for (const a of document.querySelectorAll(sel)) {
+      const href = normalizeHref(a);
+      if (!href || seen.has(href)) continue;
+      seen.add(href);
+      hrefs.push(href);
+    }
+    if (hrefs.length) return hrefs;
+  }
+
+  const hrefs = [];
+  const seen = new Set();
+  for (const a of scope.querySelectorAll("a[href]")) {
+    const href = normalizeHref(a);
+    if (!href || seen.has(href)) continue;
     const text = (a.textContent || "").trim();
     let score = 1;
     if (text.length >= 3) score += 2;
     if (/\/video|\/v\/|\/detail|\/movie/i.test(href)) score += 5;
-    if (score > bestScore) {
-      bestScore = score;
-      best = href;
-    }
+    if (score < 6) continue;
+    seen.add(href);
+    hrefs.push(href);
   }
-  return best;
+  return hrefs;
+};
+
+VDM.pickFirstResultUrl = () => VDM.collectResultUrls()[0] || "";
+
+VDM.collectResultNames = () => {
+  const { skipContainer, selectors, normalizeHref } = VDM._resultLinkContext();
+  const codePattern = /\b([A-Z]{2,6}-\d{3,6})\b/i;
+
+  const extractNameFromRoot = (root) => {
+    if (!root) return "";
+    for (const sel of [".video-title strong", ".title strong", "[class*='title'] strong"]) {
+      const el = root.querySelector(sel);
+      if (el) {
+        const text = (el.textContent || "").trim();
+        if (text) return text.toUpperCase();
+      }
+    }
+    for (const sel of [".video-title", ".title", "[class*='video-title']"]) {
+      const el = root.querySelector(sel);
+      if (el) {
+        const text = (el.textContent || "").trim();
+        const m = text.match(codePattern);
+        if (m) return m[1].toUpperCase();
+        const first = text.split(/\s+/)[0];
+        if (first) return first.toUpperCase();
+      }
+    }
+    return "";
+  };
+
+  const itemSelectors = [
+    "div.item",
+    ".item",
+    ".video-item",
+    ".search-item",
+    ".grid-item",
+    "article",
+  ];
+
+  for (const sel of itemSelectors) {
+    const names = [];
+    const seen = new Set();
+    for (const item of document.querySelectorAll(sel)) {
+      if (skipContainer(item)) continue;
+      const name = extractNameFromRoot(item);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+    if (names.length) return names;
+  }
+
+  // 與 collectResultUrls 相同連結選擇器，從 a.box / div.item 結構回退提取
+  for (const sel of selectors) {
+    const names = [];
+    const seen = new Set();
+    for (const a of document.querySelectorAll(sel)) {
+      const href = normalizeHref(a);
+      if (!href) continue;
+      const root = a.closest(".item, .video-item, .search-item, .grid-item, article") || a;
+      let name = extractNameFromRoot(root);
+      if (!name) {
+        const hint = (a.getAttribute("title") || a.textContent || "").trim();
+        const m = hint.match(codePattern);
+        if (m) name = m[1].toUpperCase();
+      }
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+    if (names.length) return names;
+  }
+
+  return [];
 };
 } // end block scope for VDM
