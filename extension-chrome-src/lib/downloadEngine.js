@@ -123,6 +123,7 @@
         total: 0,
         error: "",
         activity: "",
+        hlsLanes: [],
         startedAt: Date.now(),
       };
       this.tasks.set(task.id, task);
@@ -148,6 +149,7 @@
         downloaded: snap.downloaded || 0,
         fetched: snap.fetched || snap.downloaded || 0,
         total: snap.total || 0,
+        hlsLanes: Array.isArray(snap.hlsLanes) ? snap.hlsLanes.map((l) => ({ ...l })) : [],
         segmentDir: snap.segmentDir || "",
         segmentSubfolder:
           snap.segmentSubfolder !== undefined && snap.segmentSubfolder !== null
@@ -186,6 +188,7 @@
         downloaded: snap.downloaded || 0,
         fetched: snap.fetched || snap.downloaded || 0,
         total: snap.total || 0,
+        hlsLanes: Array.isArray(snap.hlsLanes) ? snap.hlsLanes.map((l) => ({ ...l })) : [],
         segmentDir: snap.segmentDir || "",
         segmentSubfolder:
           snap.segmentSubfolder !== undefined && snap.segmentSubfolder !== null
@@ -685,8 +688,13 @@
       scan.downloaded = rescan.downloaded;
       scan.missing = rescan.missing;
 
-      const queue = scan.missing.map((idx) => [idx, segments[idx]]);
-      const workers = VDM.getWorkerCount(Math.max(1, queue.length));
+      const existingOnDisk = [];
+      for (let i = 0; i < segments.length; i++) {
+        if (!scan.missing.includes(i)) existingOnDisk.push(i);
+      }
+      VDM.seedHlsLaneProgress(task, segments.length, existingOnDisk);
+
+      const lanes = VDM.partitionHlsLanes(segments, scan.missing);
       const copySlots = Math.min(8, Math.max(4, (VDM.maxConnections || 3) * 2));
       const maxPendingCopy = Math.max(32, (VDM.maxConnections || 3) * 12);
 
@@ -728,6 +736,7 @@
           VDM.fsaCopySegmentFromOpfsViaOffscreen(taskDir, cacheKey, idx, fsaKey)
             .then(() => {
               copyDone++;
+              VDM.markHlsLaneSegment(task, idx, "saved");
               touchProgress(false);
             })
             .catch((e) => {
@@ -761,31 +770,32 @@
         if (copyErr) throw copyErr;
       };
 
-      const worker = async () => {
-        while (queue.length && !halt) {
-          if (!this._runAlive(task.id, runGen) || this.paused.has(task.id)) return;
-          if (signal?.aborted) throw new Error("cancelled");
-          await this._waitIfPaused(task.id);
-          if (!this._runAlive(task.id, runGen)) return;
-          if (copyHalt()) break;
-          await waitCopyBackpressure();
-          const item = queue.shift();
-          if (!item) break;
-          const [idx, segUrl] = item;
+      const fetchOne = async (idx, segUrl) => {
+        if (!this._runAlive(task.id, runGen) || this.paused.has(task.id)) return;
+        if (signal?.aborted) throw new Error("cancelled");
+        await this._waitIfPaused(task.id);
+        if (!this._runAlive(task.id, runGen)) return;
+        if (copyHalt()) return;
+        await waitCopyBackpressure();
+        const buf = await this._fetchSegment(video, segUrl, signal);
+        if (!this._runAlive(task.id, runGen) || this.paused.has(task.id)) return;
+        await VDM.opfsWriteSegmentFast(cacheKey, idx, buf);
+        fetched++;
+        VDM.markHlsLaneSegment(task, idx, "fetched");
+        downloadedBytes += buf.byteLength;
+        copyQueue.push(idx);
+        pumpCopy();
+        touchProgress(false);
+      };
+
+      const runLane = async (lane) => {
+        for (const [idx, segUrl] of lane) {
+          if (halt || copyHalt()) return;
           try {
-            const buf = await this._fetchSegment(video, segUrl, signal);
-            if (!this._runAlive(task.id, runGen) || this.paused.has(task.id)) return;
-            await VDM.opfsWriteSegmentFast(cacheKey, idx, buf);
-            fetched++;
-            downloadedBytes += buf.byteLength;
-            copyQueue.push(idx);
-            pumpCopy();
-            touchProgress(false);
+            await fetchOne(idx, segUrl);
           } catch (e) {
             if (!this._runAlive(task.id, runGen) || this.paused.has(task.id)) return;
-            if (signal?.aborted || e.message === "cancelled") {
-              throw e;
-            }
+            if (signal?.aborted || e.message === "cancelled") throw e;
             halt = true;
             this._pauseOnFetchError(task, e, onProgress);
             return;
@@ -793,7 +803,30 @@
         }
       };
 
-      await Promise.all(Array.from({ length: workers }, () => worker()));
+      const runStealQueue = async (missingIndices) => {
+        if (!missingIndices?.length || halt || copyErr) return;
+        const stealQ = missingIndices.map((idx) => [idx, segments[idx]]);
+        const stealWorker = async () => {
+          while (stealQ.length && !halt) {
+            const item = stealQ.shift();
+            if (!item) break;
+            const [idx, segUrl] = item;
+            try {
+              await fetchOne(idx, segUrl);
+            } catch (e) {
+              if (!this._runAlive(task.id, runGen) || this.paused.has(task.id)) return;
+              if (signal?.aborted || e.message === "cancelled") throw e;
+              halt = true;
+              this._pauseOnFetchError(task, e, onProgress);
+              return;
+            }
+          }
+        };
+        const stealWorkers = VDM.getWorkerCount(stealQ.length);
+        await Promise.all(Array.from({ length: stealWorkers }, () => stealWorker()));
+      };
+
+      await Promise.all(lanes.map((lane) => runLane(lane)));
       if (!halt && !copyErr) {
         await drainCopies().catch((e) => {
           if (!halt) {
@@ -801,6 +834,16 @@
             this._pauseOnFetchError(task, e, onProgress);
           }
         });
+        const stealScan = await VDM.fsaScanSegmentsViaOffscreen(taskDir, segments.length, fsaKey);
+        if (stealScan.missing.length) {
+          await runStealQueue(stealScan.missing);
+          await drainCopies().catch((e) => {
+            if (!halt) {
+              halt = true;
+              this._pauseOnFetchError(task, e, onProgress);
+            }
+          });
+        }
       }
       if (this.paused.has(task.id) || task.status === "paused") {
         await drainCopies().catch(() => {});
@@ -1033,30 +1076,34 @@
 
       task.total = segments.length;
       task.status = "downloading";
+      VDM.initHlsLaneProgress(task, segments.length);
       const buffers = new Array(segments.length);
       let completed = 0;
       let downloadedBytes = 0;
       const state = { lastTime: Date.now(), lastBytes: 0 };
-      const queue = [...segments.entries()];
-      const workers = VDM.getWorkerCount(segments.length);
+      const lanes = VDM.partitionHlsLanes(segments, null);
       let halt = false;
 
-      const worker = async () => {
-        while (queue.length && !halt) {
-          if (signal?.aborted) throw new Error("cancelled");
-          await this._waitIfPaused(task.id);
-          const item = queue.shift();
-          if (!item) break;
-          const [idx, segUrl] = item;
+      const fetchToBuffer = async (idx, segUrl) => {
+        if (signal?.aborted) throw new Error("cancelled");
+        await this._waitIfPaused(task.id);
+        const buf = await this._fetchSegment(video, segUrl, signal);
+        buffers[idx] = buf;
+        VDM.markHlsLaneSegment(task, idx, "fetched");
+        VDM.markHlsLaneSegment(task, idx, "saved");
+        completed++;
+        downloadedBytes += buf.byteLength;
+        task.downloaded = completed;
+        task.progress = Math.min(90, (completed * 90) / segments.length);
+        this._updateSpeed(task, downloadedBytes, state);
+        onProgress(task);
+      };
+
+      const runLane = async (lane) => {
+        for (const [idx, segUrl] of lane) {
+          if (halt) return;
           try {
-            const buf = await this._fetchSegment(video, segUrl, signal);
-            buffers[idx] = buf;
-            completed++;
-            downloadedBytes += buf.byteLength;
-            task.downloaded = completed;
-            task.progress = Math.min(90, (completed * 90) / segments.length);
-            this._updateSpeed(task, downloadedBytes, state);
-            onProgress(task);
+            await fetchToBuffer(idx, segUrl);
           } catch (e) {
             if (signal?.aborted || e.message === "cancelled") {
               if (this.paused.has(task.id)) return;
@@ -1069,7 +1116,39 @@
         }
       };
 
-      await Promise.all(Array.from({ length: workers }, () => worker()));
+      const runStealQueue = async (missingIndices) => {
+        if (!missingIndices?.length || halt) return;
+        const stealQ = missingIndices.map((idx) => [idx, segments[idx]]);
+        const stealWorker = async () => {
+          while (stealQ.length && !halt) {
+            const item = stealQ.shift();
+            if (!item) break;
+            const [idx, segUrl] = item;
+            try {
+              await fetchToBuffer(idx, segUrl);
+            } catch (e) {
+              if (signal?.aborted || e.message === "cancelled") {
+                if (this.paused.has(task.id)) return;
+                throw e;
+              }
+              halt = true;
+              this._pauseOnFetchError(task, e, onProgress);
+              return;
+            }
+          }
+        };
+        const stealWorkers = VDM.getWorkerCount(stealQ.length);
+        await Promise.all(Array.from({ length: stealWorkers }, () => stealWorker()));
+      };
+
+      await Promise.all(lanes.map((lane) => runLane(lane)));
+      if (!halt) {
+        const missing = [];
+        for (let i = 0; i < segments.length; i++) {
+          if (!buffers[i]) missing.push(i);
+        }
+        if (missing.length) await runStealQueue(missing);
+      }
       if (this.paused.has(task.id) || task.status === "paused") return;
       if (halt) return;
 
@@ -1126,8 +1205,12 @@
       let downloadedBytes = 0;
       const state = { lastTime: Date.now(), lastBytes: 0, lastActAt: 0 };
       const needIndices = await VDM.opfsSegmentsToFetch(cacheKey, segments.length, mergedThrough);
-      const queue = needIndices.map((idx) => [idx, segments[idx]]);
-      const workers = VDM.getWorkerCount(Math.max(1, queue.length));
+      const existingOnDisk = [];
+      for (let i = mergedThrough; i < segments.length; i++) {
+        if (!needIndices.includes(i)) existingOnDisk.push(i);
+      }
+      VDM.seedHlsLaneProgress(task, segments.length, existingOnDisk);
+      const lanes = VDM.partitionHlsLanes(segments, needIndices);
       const merger = VDM.createOpfsStreamMerger(cacheKey, segments.length, {
         startAppend: mergedThrough,
         startBytes: mergedBytes,
@@ -1158,31 +1241,32 @@
         task.downloadProgress = VDM.segmentProgressPct(task.downloaded, segments.length);
       }
 
-      const worker = async () => {
-        while (queue.length && !halt) {
-          if (signal?.aborted) throw new Error("cancelled");
-          await this._waitIfPaused(task.id);
-          const item = queue.shift();
-          if (!item) break;
-          const [idx, segUrl] = item;
+      const fetchOne = async (idx, segUrl) => {
+        if (signal?.aborted) throw new Error("cancelled");
+        await this._waitIfPaused(task.id);
+        await this._waitIfMergeLag(task, merger, onMergeProgress, onProgress);
+        const buf = await this._fetchSegment(video, segUrl, signal);
+        await VDM.opfsWriteSegment(cacheKey, idx, buf);
+        VDM.markHlsLaneSegment(task, idx, "fetched");
+        VDM.markHlsLaneSegment(task, idx, "saved");
+        task.downloaded = Math.max(task.downloaded || task.merged || 0, idx + 1);
+        task.downloadProgress = VDM.segmentProgressPct(task.downloaded, segments.length);
+        if (idx % 15 === 0 || idx === segments.length - 1) {
+          VDM.setTaskActivity(
+            task,
+            `下載片段 ${task.downloaded}/${segments.length}  ·  合併 ${task.merged || 0}/${segments.length}`
+          );
+        }
+        merger.onSegmentWritten(onMergeProgress).catch(() => {});
+        this._updateSpeed(task, downloadedBytes, state);
+        onProgress(task);
+      };
+
+      const runLane = async (lane) => {
+        for (const [idx, segUrl] of lane) {
+          if (halt) return;
           try {
-            await this._waitIfMergeLag(task, merger, onMergeProgress, onProgress);
-            const buf = await this._fetchSegment(video, segUrl, signal);
-            await VDM.opfsWriteSegment(cacheKey, idx, buf);
-            // 增量更新進度，避免每段掃描 OPFS 目錄（1770 段 × 每段掃描 = 百萬次 I/O）
-            task.downloaded = Math.max(task.downloaded || task.merged || 0, idx + 1);
-            task.downloadProgress = VDM.segmentProgressPct(task.downloaded, segments.length);
-            if (idx % 15 === 0 || idx === segments.length - 1) {
-              VDM.setTaskActivity(
-                task,
-                `下載片段 ${task.downloaded}/${segments.length}  ·  合併 ${task.merged || 0}/${segments.length}`
-              );
-            }
-            // fire-and-forget：merge 在背景跑，worker 立即繼續下一個片段
-            // 這樣下載速度不受 OPFS commit 速度拖累；finish() 確保所有片段都合併完畢
-            merger.onSegmentWritten(onMergeProgress).catch(() => {});
-            this._updateSpeed(task, downloadedBytes, state);
-            onProgress(task);
+            await fetchOne(idx, segUrl);
           } catch (e) {
             if (signal?.aborted || e.message === "cancelled") {
               if (this.paused.has(task.id)) return;
@@ -1195,7 +1279,36 @@
         }
       };
 
-      await Promise.all(Array.from({ length: workers }, () => worker()));
+      const runStealQueue = async (missingIndices) => {
+        if (!missingIndices?.length || halt) return;
+        const stealQ = missingIndices.map((idx) => [idx, segments[idx]]);
+        const stealWorker = async () => {
+          while (stealQ.length && !halt) {
+            const item = stealQ.shift();
+            if (!item) break;
+            const [idx, segUrl] = item;
+            try {
+              await fetchOne(idx, segUrl);
+            } catch (e) {
+              if (signal?.aborted || e.message === "cancelled") {
+                if (this.paused.has(task.id)) return;
+                throw e;
+              }
+              halt = true;
+              this._pauseOnFetchError(task, e, onProgress);
+              return;
+            }
+          }
+        };
+        const stealWorkers = VDM.getWorkerCount(stealQ.length);
+        await Promise.all(Array.from({ length: stealWorkers }, () => stealWorker()));
+      };
+
+      await Promise.all(lanes.map((lane) => runLane(lane)));
+      if (!halt) {
+        const stillNeed = await VDM.opfsSegmentsToFetch(cacheKey, segments.length, mergedThrough);
+        if (stillNeed.length) await runStealQueue(stillNeed);
+      }
       if (this.paused.has(task.id) || task.status === "paused") {
         await merger.pause().catch(() => {});
         VDM.setTaskActivity(

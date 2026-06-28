@@ -427,26 +427,27 @@
       let completed = 0;
       let downloadedBytes = 0;
       const state = { lastTime: Date.now(), lastBytes: 0 };
-      const queue = [...segments.entries()];
-      const workers = VDM.getWorkerCount(segments.length);
+      const lanes = VDM.partitionHlsLanes(segments, null);
       let halt = false;
 
-      const worker = async () => {
-        while (queue.length && !halt) {
-          if (signal?.aborted) throw new Error("cancelled");
-          await this._waitIfPaused(task.id);
-          const item = queue.shift();
-          if (!item) break;
-          const [idx, segUrl] = item;
+      const fetchToBuffer = async (idx, segUrl) => {
+        if (signal?.aborted) throw new Error("cancelled");
+        await this._waitIfPaused(task.id);
+        const buf = await this._fetchSegment(video, segUrl, signal);
+        buffers[idx] = buf;
+        completed++;
+        downloadedBytes += buf.byteLength;
+        task.downloaded = completed;
+        task.progress = Math.min(90, (completed * 90) / segments.length);
+        this._updateSpeed(task, downloadedBytes, state);
+        onProgress(task);
+      };
+
+      const runLane = async (lane) => {
+        for (const [idx, segUrl] of lane) {
+          if (halt) return;
           try {
-            const buf = await this._fetchSegment(video, segUrl, signal);
-            buffers[idx] = buf;
-            completed++;
-            downloadedBytes += buf.byteLength;
-            task.downloaded = completed;
-            task.progress = Math.min(90, (completed * 90) / segments.length);
-            this._updateSpeed(task, downloadedBytes, state);
-            onProgress(task);
+            await fetchToBuffer(idx, segUrl);
           } catch (e) {
             if (signal?.aborted || e.message === "cancelled") {
               if (this.paused.has(task.id)) return;
@@ -459,7 +460,39 @@
         }
       };
 
-      await Promise.all(Array.from({ length: workers }, () => worker()));
+      const runStealQueue = async (missingIndices) => {
+        if (!missingIndices?.length || halt) return;
+        const stealQ = missingIndices.map((idx) => [idx, segments[idx]]);
+        const stealWorker = async () => {
+          while (stealQ.length && !halt) {
+            const item = stealQ.shift();
+            if (!item) break;
+            const [idx, segUrl] = item;
+            try {
+              await fetchToBuffer(idx, segUrl);
+            } catch (e) {
+              if (signal?.aborted || e.message === "cancelled") {
+                if (this.paused.has(task.id)) return;
+                throw e;
+              }
+              halt = true;
+              this._pauseOnFetchError(task, e, onProgress);
+              return;
+            }
+          }
+        };
+        const stealWorkers = VDM.getWorkerCount(stealQ.length);
+        await Promise.all(Array.from({ length: stealWorkers }, () => stealWorker()));
+      };
+
+      await Promise.all(lanes.map((lane) => runLane(lane)));
+      if (!halt) {
+        const missing = [];
+        for (let i = 0; i < segments.length; i++) {
+          if (!buffers[i]) missing.push(i);
+        }
+        if (missing.length) await runStealQueue(missing);
+      }
       if (this.paused.has(task.id) || task.status === "paused") return;
       if (halt) return;
 
@@ -506,8 +539,7 @@
       let downloadedBytes = 0;
       const state = { lastTime: Date.now(), lastBytes: 0 };
       const needIndices = await VDM.opfsSegmentsToFetch(cacheKey, segments.length, mergedThrough);
-      const queue = needIndices.map((idx) => [idx, segments[idx]]);
-      const workers = VDM.getWorkerCount(Math.max(1, queue.length));
+      const lanes = VDM.partitionHlsLanes(segments, needIndices);
       const merger = VDM.createOpfsStreamMerger(cacheKey, segments.length, {
         startAppend: mergedThrough,
       });
@@ -529,25 +561,27 @@
         task.downloadProgress = VDM.segmentProgressPct(task.downloaded, segments.length);
       }
 
-      const worker = async () => {
-        while (queue.length && !halt) {
-          if (signal?.aborted) throw new Error("cancelled");
-          await this._waitIfPaused(task.id);
-          const item = queue.shift();
-          if (!item) break;
-          const [idx, segUrl] = item;
+      const fetchOne = async (idx, segUrl) => {
+        if (signal?.aborted) throw new Error("cancelled");
+        await this._waitIfPaused(task.id);
+        const buf = await this._fetchSegment(video, segUrl, signal);
+        await VDM.opfsWriteSegment(cacheKey, idx, buf);
+        task.downloaded = await VDM.opfsBufferedCount(
+          cacheKey,
+          segments.length,
+          task.merged
+        );
+        task.downloadProgress = VDM.segmentProgressPct(task.downloaded, segments.length);
+        await merger.onSegmentWritten(onMergeProgress);
+        this._updateSpeed(task, downloadedBytes, state);
+        onProgress(task);
+      };
+
+      const runLane = async (lane) => {
+        for (const [idx, segUrl] of lane) {
+          if (halt) return;
           try {
-            const buf = await this._fetchSegment(video, segUrl, signal);
-            await VDM.opfsWriteSegment(cacheKey, idx, buf);
-            task.downloaded = await VDM.opfsBufferedCount(
-              cacheKey,
-              segments.length,
-              task.merged
-            );
-            task.downloadProgress = VDM.segmentProgressPct(task.downloaded, segments.length);
-            await merger.onSegmentWritten(onMergeProgress);
-            this._updateSpeed(task, downloadedBytes, state);
-            onProgress(task);
+            await fetchOne(idx, segUrl);
           } catch (e) {
             if (signal?.aborted || e.message === "cancelled") {
               if (this.paused.has(task.id)) return;
@@ -560,7 +594,36 @@
         }
       };
 
-      await Promise.all(Array.from({ length: workers }, () => worker()));
+      const runStealQueue = async (missingIndices) => {
+        if (!missingIndices?.length || halt) return;
+        const stealQ = missingIndices.map((idx) => [idx, segments[idx]]);
+        const stealWorker = async () => {
+          while (stealQ.length && !halt) {
+            const item = stealQ.shift();
+            if (!item) break;
+            const [idx, segUrl] = item;
+            try {
+              await fetchOne(idx, segUrl);
+            } catch (e) {
+              if (signal?.aborted || e.message === "cancelled") {
+                if (this.paused.has(task.id)) return;
+                throw e;
+              }
+              halt = true;
+              this._pauseOnFetchError(task, e, onProgress);
+              return;
+            }
+          }
+        };
+        const stealWorkers = VDM.getWorkerCount(stealQ.length);
+        await Promise.all(Array.from({ length: stealWorkers }, () => stealWorker()));
+      };
+
+      await Promise.all(lanes.map((lane) => runLane(lane)));
+      if (!halt) {
+        const stillNeed = await VDM.opfsSegmentsToFetch(cacheKey, segments.length, mergedThrough);
+        if (stillNeed.length) await runStealQueue(stillNeed);
+      }
       if (this.paused.has(task.id) || task.status === "paused") return;
       if (halt) return;
 

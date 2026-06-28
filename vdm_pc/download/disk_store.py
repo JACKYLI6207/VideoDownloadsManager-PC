@@ -94,6 +94,22 @@ def segments_to_fetch(cache_root: Path, video_id: str, merged_through: int, tota
     return [i for i in range(merged_through, total) if not (folder / seg_name(i)).is_file()]
 
 
+def partition_hls_lanes(total: int, need: list[int], workers: int) -> list[list[int]]:
+    """依 playlist 索引等分為 workers 條 HLS 車道，每道只含 need 中落在該區間的索引。"""
+    if total <= 0 or not need:
+        return []
+    pool = max(1, min(workers, len(need)))
+    need_set = set(need)
+    lanes: list[list[int]] = [[] for _ in range(pool)]
+    for w in range(pool):
+        start = total * w // pool
+        end = total * (w + 1) // pool
+        for i in range(start, end):
+            if i in need_set:
+                lanes[w].append(i)
+    return lanes
+
+
 def count_on_disk_segments(folder: Path, merged_through: int, total: int) -> int:
     n = 0
     for i in range(merged_through, total):

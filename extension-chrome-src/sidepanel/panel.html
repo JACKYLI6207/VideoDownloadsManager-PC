@@ -131,7 +131,7 @@
         <div class="setting-block">
           <label class="setting-label" for="maxConnections">單任務最大連線數（HLS 片段並行）</label>
           <input type="number" id="maxConnections" class="setting-input setting-input-num" min="1" value="3" step="1" />
-          <p class="setting-hint">單任務 HLS 片段並行數。全局並行 ≈ 任務數 × 此值。設過高可能被限速或不穩。</p>
+          <p class="setting-hint">單任務 HLS 並行車道數：playlist 依索引等分為 N 區同時下載缺段。全局並行 ≈ 任務數 × 此值。設過高可能被限速或不穩。</p>
         </div>
         <div class="setting-block">
           <label class="setting-label">片段存檔位置 <span class="badge badge-new">必設</span></label>

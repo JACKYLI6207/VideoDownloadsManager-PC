@@ -564,18 +564,34 @@ class DownloadEngine(QObject):
                 return size
             finally:
                 self._release_slot()
-        with self._make_client(pool_workers) as client, ThreadPoolExecutor(max_workers=pool_workers) as pool:
-            futures = {pool.submit(work, client, i): i for i in need}
-            for fut in as_completed(futures):
+
+        def lane_work(client: httpx.Client, indices: list[int]) -> None:
+            for idx in indices:
                 if not self._alive(task.id, gen):
                     raise RuntimeError("cancelled")
-                size = fut.result()
+                size = work(client, idx)
+                nonlocal downloaded_bytes
                 downloaded_bytes += size
                 task.downloaded = merger.buffered_count
                 task.download_progress = self._seg_pct(task.downloaded, len(segments))
                 merger.on_segment_written(on_merge)
                 self._update_speed(task, downloaded_bytes, speed_state)
                 self._emit(task.id)
+
+        def run_indices(client: httpx.Client, indices: list[int]) -> None:
+            lanes = disk_store.partition_hls_lanes(len(segments), indices, pool_workers)
+            with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as pool:
+                futs = [pool.submit(lane_work, client, lane) for lane in lanes if lane]
+                for fut in as_completed(futs):
+                    if not self._alive(task.id, gen):
+                        raise RuntimeError("cancelled")
+                    fut.result()
+
+        with self._make_client(pool_workers) as client:
+            run_indices(client, need)
+            steal = disk_store.segments_to_fetch(cache, video.id, merger.next_append, len(segments))
+            if steal:
+                run_indices(client, steal)
         merger.finish(on_merge)
         self._finalize_hls_mp4(task, cache, video.id, out, gen)
     def _download_http(self, task: DownloadTask, gen: int) -> None:

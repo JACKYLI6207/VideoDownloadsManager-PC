@@ -417,6 +417,27 @@ function taskDisplayName(t) {
   return (t.fileName || "").replace(/\.mp4$/i, "") || t.video?.title || "video";
 }
 
+/** HLS 各並行車道進度列（依 maxConnections 分段） */
+function renderHlsLaneRows(t, isHls) {
+  if (!isHls || !t.hlsLanes?.length || t.hlsLanes.length <= 1) return "";
+  const rows = t.hlsLanes.map((lane) => {
+    const inflight = lane.fetched || 0;
+    const saved = lane.saved || 0;
+    const show = segmentsOnlyMode ? Math.max(saved, inflight) : inflight;
+    const lp = segmentProgressPct(show, lane.total);
+    const label = segmentsOnlyMode
+      ? `下載 ${inflight}/${lane.total} · 存 ${saved}/${lane.total}`
+      : `${show}/${lane.total}`;
+    return `
+      <div class="progress-row lane-row">
+        <span class="progress-tag">#${lane.index}</span>
+        <div class="progress-wrap"><div class="progress-bar lane" style="width:${lp}%"></div></div>
+        <span class="progress-pct lane-pct">${escapeHtml(label)}</span>
+      </div>`;
+  });
+  return `<div class="lane-progress-block">${rows.join("")}</div>`;
+}
+
 function updateActiveToolbar(active) {
   const toolbar = $("#activeToolbar");
   const bulkBar = $("#activeBulkBar");
@@ -484,8 +505,8 @@ function renderActive(tasks) {
       const saved = t.downloaded || 0;
       const inflight = t.fetched || saved;
       sizeText = segmentsOnlyMode
-        ? `存檔 ${saved}/${t.total}${inflight > saved ? ` · 下載中 ${inflight}/${t.total}` : ""}  ·  ${formatSpeed(t.status === "paused" ? 0 : t.speed)}`
-        : `${saved}/${t.total}  ·  ${formatSpeed(t.status === "paused" ? 0 : t.speed)}`;
+        ? `整體 存檔 ${saved}/${t.total} · 下載 ${inflight}/${t.total}  ·  ${formatSpeed(t.status === "paused" ? 0 : t.speed)}`
+        : `整體 ${saved}/${t.total}  ·  ${formatSpeed(t.status === "paused" ? 0 : t.speed)}`;
     } else if (t.total) {
       sizeText = `${formatSize(t.downloaded)} / ${formatSize(t.total)}  ·  ${formatSpeed(t.speed)}`;
     } else {
@@ -518,6 +539,8 @@ function renderActive(tasks) {
         <span class="progress-pct">${pct}%</span>
       </div>`;
 
+    const laneHtml = renderHlsLaneRows(t, isHls);
+
     const card = document.createElement("div");
     const statusCls = taskStatusClass(t.status);
     card.className = `card task-card ${statusCls}${t.status === "failed" ? " failed" : ""}`;
@@ -529,6 +552,7 @@ function renderActive(tasks) {
         <div class="title">${escapeHtml(name)}</div>
       </label>
       ${progressHtml}
+      ${laneHtml}
       <div class="meta">
         <span class="status-badge badge-${t.status}">${escapeHtml(statusText(t.status))}</span>
         <span class="meta-detail">${escapeHtml(sizeText)}</span>

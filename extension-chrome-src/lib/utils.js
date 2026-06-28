@@ -76,6 +76,74 @@ VDM.diag = (message, detail = "") => {
 VDM.getWorkerCount = (total) =>
   Math.max(1, Math.min(VDM.maxConnections || 3, total || 1));
 
+/** 依 playlist 索引等分為 N 條 HLS 車道（N = 單任務最大連線數）。 */
+VDM.partitionHlsLanes = (segments, needIndices) => {
+  const total = segments?.length || 0;
+  if (!total) return [];
+  const need = needIndices?.length
+    ? needIndices
+    : Array.from({ length: total }, (_, i) => i);
+  const needSet = new Set(need);
+  const workers = VDM.getWorkerCount(Math.max(1, need.length));
+  const lanes = Array.from({ length: workers }, () => []);
+  for (let w = 0; w < workers; w++) {
+    const start = Math.floor((total * w) / workers);
+    const end = Math.floor((total * (w + 1)) / workers);
+    for (let i = start; i < end; i++) {
+      if (needSet.has(i)) lanes[w].push([i, segments[i]]);
+    }
+  }
+  return lanes;
+};
+
+/** 依 maxConnections 計算 playlist 索引區間（供 UI 車道進度） */
+VDM.hlsLaneRanges = (segmentCount) => {
+  const total = Math.max(0, Number(segmentCount) || 0);
+  if (!total) return [];
+  const workers = VDM.getWorkerCount(total);
+  const ranges = [];
+  for (let w = 0; w < workers; w++) {
+    const start = Math.floor((total * w) / workers);
+    const end = Math.floor((total * (w + 1)) / workers);
+    if (end > start) ranges.push({ start, end, total: end - start });
+  }
+  return ranges;
+};
+
+VDM.initHlsLaneProgress = (task, segmentCount) => {
+  const ranges = VDM.hlsLaneRanges(segmentCount);
+  task.hlsLanes = ranges.map((r, i) => ({
+    index: i + 1,
+    start: r.start,
+    end: r.end,
+    total: r.total,
+    fetched: 0,
+    saved: 0,
+  }));
+  task._hlsLaneMarks = { fetched: new Set(), saved: new Set() };
+};
+
+/** kind: "fetched" | "saved" */
+VDM.markHlsLaneSegment = (task, index, kind) => {
+  if (!task?.hlsLanes?.length) return;
+  if (!task._hlsLaneMarks) task._hlsLaneMarks = { fetched: new Set(), saved: new Set() };
+  const set = task._hlsLaneMarks[kind];
+  if (!set || set.has(index)) return;
+  set.add(index);
+  const lane = task.hlsLanes.find((l) => index >= l.start && index < l.end);
+  if (!lane) return;
+  if (kind === "fetched") lane.fetched = (lane.fetched || 0) + 1;
+  else if (kind === "saved") lane.saved = (lane.saved || 0) + 1;
+};
+
+VDM.seedHlsLaneProgress = (task, segmentCount, existingIndices) => {
+  VDM.initHlsLaneProgress(task, segmentCount);
+  for (const i of existingIndices || []) {
+    VDM.markHlsLaneSegment(task, i, "fetched");
+    VDM.markHlsLaneSegment(task, i, "saved");
+  }
+};
+
 VDM.clampConnections = (n) => {
   const v = Math.floor(Number(n));
   if (!Number.isFinite(v) || v < 1) return 3;

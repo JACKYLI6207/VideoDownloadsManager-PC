@@ -523,6 +523,7 @@ function taskSnapshot(t) {
     downloaded: t.downloaded,
     fetched: t.fetched,
     total: t.total,
+    hlsLanes: t.hlsLanes || [],
     activity: t.activity || "",
     segmentDir: t.segmentDir || "",
     error: t.error,
